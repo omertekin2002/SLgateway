@@ -74,7 +74,7 @@ Configuration is validated once when the process starts. Secret values belong in
 | `GEMINI_SEARCH_MODEL` | No | `gemini-2.5-flash` | Gemini model used for grounded research. |
 | `PRIMARY_LLM_BASE_URL` | Conditional | — | HTTP(S) base URL of the primary OpenAI-compatible Responses API. Must be set together with `PRIMARY_LLM_API_KEY`. |
 | `PRIMARY_LLM_API_KEY` | Conditional | — | Primary-provider credential. Must be set together with `PRIMARY_LLM_BASE_URL`. |
-| `PRIMARY_LLM_MODEL` | No | `gemini-3-flash` | Server-controlled model for the primary provider. It is not accepted from API clients. |
+| `PRIMARY_LLM_MODEL` | No | `gpt-5.6-luna` | Server-controlled model for the primary provider. It is not accepted from API clients. |
 | `OPENROUTER_API_KEY` | Conditional | — | Enables OpenRouter generation and fallback. Required if the primary path is absent. |
 | `OPENROUTER_BASE_URL` | No | `https://openrouter.ai/api/v1` | OpenRouter-compatible HTTP(S) base URL. |
 | `PUBLIC_SERVICE_URL` | No | `RENDER_EXTERNAL_URL`, then `http://localhost:<PORT>` | Public service identity sent to compatible providers as `HTTP-Referer`. |

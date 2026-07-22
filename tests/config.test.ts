@@ -41,7 +41,7 @@ describe("loadServiceConfig", () => {
     expect(config.primaryLlm).toEqual({
       baseUrl: "https://primary.example.test/v1",
       apiKey: "primary-secret",
-      model: "gemini-3-flash",
+      model: "gpt-5.6-luna",
     });
     expect(config.openRouter).toBeNull();
   });

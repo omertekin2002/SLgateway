@@ -144,7 +144,7 @@ export function loadServiceConfig(
     ? credentialValue("PRIMARY_LLM_API_KEY", rawPrimaryApiKey)
     : null;
   const primaryModel =
-    optionalValue(environment, "PRIMARY_LLM_MODEL") ?? "gemini-3-flash";
+    optionalValue(environment, "PRIMARY_LLM_MODEL") ?? "gpt-5.6-luna";
 
   if ((primaryBaseUrl && !primaryApiKey) || (!primaryBaseUrl && primaryApiKey)) {
     throw new Error(
