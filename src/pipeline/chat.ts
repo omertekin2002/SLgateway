@@ -1,17 +1,10 @@
 import OpenAI from "openai";
 
-import {
-  BARE_LLM_SYSTEM_PROMPT,
-  CHAT_SYSTEM_PROMPT,
-} from "../prompts";
 import { buildAuthoritativeUtcTimeContext } from "./chat-time";
 import {
   prepareMessagesWithGeminiWebSearch,
   type WebSearchMetadata,
 } from "./gemini-search";
-import {
-  type PersonalityMode,
-} from "./personality";
 import {
   OPENROUTER_MODELS,
   createOpenAiCompatibleClient,
@@ -104,22 +97,6 @@ function isAbortError(error: unknown, signal?: AbortSignal): boolean {
     error instanceof Error &&
     (error.name === "AbortError" || error.name === "APIUserAbortError")
   );
-}
-
-/** Prepends the server-owned system prompt selected by a validated personality. */
-export function buildChatPromptMessages(
-  messages: readonly ChatMessage[],
-  personality: PersonalityMode,
-): ChatMessage[] {
-  const systemPrompt =
-    personality === "bare-llm"
-      ? BARE_LLM_SYSTEM_PROMPT
-      : CHAT_SYSTEM_PROMPT;
-
-  return [
-    { role: "system", content: systemPrompt },
-    ...messages.map((message) => ({ ...message })),
-  ];
 }
 
 function toResponseInput(messages: readonly ChatMessage[]) {

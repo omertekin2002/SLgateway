@@ -13,7 +13,6 @@ import {
   type ServiceConfig,
 } from "./config";
 import {
-  buildChatPromptMessages,
   generateChatReply,
   generateChatReplyStream,
   type ChatMessage,
@@ -27,11 +26,6 @@ import {
 } from "./pipeline/chat-policy";
 import { GeminiWebSearchError } from "./pipeline/gemini-search";
 import type { ProviderConfig } from "./pipeline/llm-client";
-import {
-  DEFAULT_PERSONALITY_MODE,
-  isAllowedPersonalityMode,
-  type PersonalityMode,
-} from "./pipeline/personality";
 import {
   DEFAULT_CHAT_ERROR_MESSAGE,
   appendWebSourcesToMessage,
@@ -76,7 +70,6 @@ type RequestLogContext = {
   route: string;
   startedAt: number;
   streaming?: boolean;
-  personality?: PersonalityMode;
   messageCount?: number;
   totalMessageCharacters?: number;
 };
@@ -349,16 +342,6 @@ function declaredBodyTooLarge(request: Request): boolean {
   return Number.isFinite(length) && length > MAX_CHAT_REQUEST_BODY_BYTES;
 }
 
-function parsePersonality(
-  body: Record<string, unknown>,
-): PersonalityMode | null {
-  if (body.personality === undefined) return DEFAULT_PERSONALITY_MODE;
-  return typeof body.personality === "string" &&
-    isAllowedPersonalityMode(body.personality)
-    ? body.personality
-    : null;
-}
-
 function parseStreaming(body: Record<string, unknown>): boolean | null {
   if (body.stream === undefined) return true;
   return typeof body.stream === "boolean" ? body.stream : null;
@@ -413,7 +396,6 @@ export function createRequestHandler(
         ...(context.streaming !== undefined
           ? { streaming: context.streaming }
           : {}),
-        ...(context.personality ? { personality: context.personality } : {}),
         ...(context.messageCount !== undefined
           ? { messageCount: context.messageCount }
           : {}),
@@ -538,16 +520,11 @@ export function createRequestHandler(
         );
       }
 
-      const personality = parsePersonality(body);
-      if (!personality) {
-        return respond({ error: "Invalid personality." }, 400);
-      }
       const streaming = parseStreaming(body);
       if (streaming === null) {
         return respond({ error: "stream must be a boolean." }, 400);
       }
 
-      context.personality = personality;
       context.streaming = streaming;
       context.messageCount = parsedMessages.messages.length;
       context.totalMessageCharacters = parsedMessages.messages.reduce(
@@ -555,10 +532,6 @@ export function createRequestHandler(
         0,
       );
 
-      const promptMessages = buildChatPromptMessages(
-        parsedMessages.messages,
-        personality,
-      );
       const pipelineOptions: PipelineRequestOptions = {
         signal: scope.signal,
         requestId,
@@ -568,7 +541,7 @@ export function createRequestHandler(
         let reply: ChatReply;
         try {
           reply = await waitWithAbort(
-            pipeline.generate(promptMessages, pipelineOptions),
+            pipeline.generate(parsedMessages.messages, pipelineOptions),
             scope.signal,
           );
         } catch (error) {
@@ -617,7 +590,7 @@ export function createRequestHandler(
 
           try {
             iterator = pipeline
-              .stream(promptMessages, pipelineOptions)
+              .stream(parsedMessages.messages, pipelineOptions)
               [Symbol.asyncIterator]();
             for (;;) {
               const result = await waitWithAbort(

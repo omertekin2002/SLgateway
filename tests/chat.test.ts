@@ -2,7 +2,6 @@ import type OpenAI from "openai";
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  buildChatPromptMessages,
   generateChatReply,
   generateChatReplyStream,
   type ChatMessage,
@@ -86,22 +85,6 @@ async function collectStream(
   for await (const chunk of stream) chunks.push(chunk);
   return chunks;
 }
-
-describe("buildChatPromptMessages", () => {
-  it("prepends the validated server-owned personality prompt", () => {
-    const userMessages: ChatMessage[] = [{ role: "user", content: "Hello" }];
-    const signLoop = buildChatPromptMessages(
-      userMessages,
-      "signloop-assistant",
-    );
-    const bare = buildChatPromptMessages(userMessages, "bare-llm");
-
-    expect(signLoop[0]).toMatchObject({ role: "system" });
-    expect(signLoop[0]?.content).toContain("SignLoop's legal contract assistant");
-    expect(bare[0]?.content).toContain("general-purpose AI language model");
-    expect(userMessages).toEqual([{ role: "user", content: "Hello" }]);
-  });
-});
 
 describe("generateChatReply", () => {
   it("injects authoritative current time without mutating caller messages", async () => {

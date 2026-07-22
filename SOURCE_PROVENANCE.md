@@ -18,8 +18,7 @@ Every source file was read from that commit. No generated files, local environme
 | `apps/web/lib/gemini-search.ts` | `src/pipeline/gemini-search.ts` | Retains grounded Google research, source validation, bounded evidence, and prompt-injection defenses; accepts an explicit API key/model and abort signal. |
 | `apps/web/lib/chat-policy.ts` | `src/pipeline/chat-policy.ts` | Retains message/history/body limits, validation, incremental JSON parsing, and inline generated-image compaction. |
 | `apps/web/lib/chat-time.ts` | `src/pipeline/chat-time.ts` | Retains authoritative current UTC date/time context. |
-| `apps/web/lib/personality-settings.ts` | `src/pipeline/personality.ts` | Retains the two supported personality identifiers and default. |
-| `apps/web/app/api/chat/route.ts` | `src/prompts.ts`, `src/handler.ts` | Retains server-owned prompts, source-link attachment, safe errors, NDJSON events, and response metadata; replaces Next/Clerk/database behavior with service-key HTTP handling. |
+| `apps/web/app/api/chat/route.ts` | `src/prompts.ts`, `src/handler.ts` | Retains source-link attachment, safe errors, NDJSON events, and response metadata; removes chat identity prompts and replaces Next/Clerk/database behavior with service-key HTTP handling. |
 | `apps/web/lib/utils.ts` | `src/utils.ts` | Extracts only `isRecord` and `getErrorMessage`, avoiding UI dependencies. |
 | `apps/web/lib/chat.test.ts` | `tests/chat.test.ts` | Ports UTC, one-search, evidence reuse, fail-closed, delta, and streaming fallback coverage using injected providers. |
 | `apps/web/lib/chat-policy.test.ts` | `tests/chat-policy.test.ts` | Ports request/history limit, role validation, bounded-reader, and inline-image compaction coverage. |

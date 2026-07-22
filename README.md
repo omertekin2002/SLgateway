@@ -1,6 +1,6 @@
 # SignLoop Chat Service
 
-A standalone, stateless, text-only HTTP extraction of SignLoop's chat-generation pipeline. It exposes a small authenticated API for SignLoop Assistant or bare-LLM conversations, performs Gemini-grounded Google research for every chat turn, and generates a response through a server-configured OpenAI-compatible provider with ordered OpenRouter fallback.
+A standalone, stateless, text-only HTTP extraction of SignLoop's chat-generation pipeline. It exposes a small authenticated chat API, performs Gemini-grounded Google research for every turn, and generates a response through a server-configured OpenAI-compatible provider with ordered OpenRouter fallback.
 
 This repository contains no UI, Clerk integration, database, saved threads, uploads, or model selector. The service does not store conversations: callers must send the complete conversation history with every request.
 
@@ -11,7 +11,7 @@ client
   -> Bun.serve HTTP boundary
   -> Bearer authentication + per-process concurrency gate
   -> bounded JSON reader + conversation validation
-  -> server-owned personality prompt + authoritative UTC time
+  -> authoritative UTC time
   -> one Gemini-grounded Google research pass (required)
   -> primary OpenAI-compatible model
        -> OpenRouter fallbacks in fixed order, when eligible
@@ -115,7 +115,6 @@ Every request supplies the complete conversation history:
       "content": "Explain indemnification clauses."
     }
   ],
-  "personality": "signloop-assistant",
   "stream": false
 }
 ```
@@ -125,7 +124,6 @@ Request rules:
 - `messages` is required and must be a non-empty array.
 - Only `user` and `assistant` roles are accepted. Client-supplied `system` messages are rejected.
 - The final message must have the `user` role.
-- `personality` is optional and defaults to `signloop-assistant`; the other valid value is `bare-llm`.
 - `stream` is optional and defaults to `true`.
 - A client-controlled model or provider URL is not supported.
 
@@ -143,7 +141,6 @@ curl --fail-with-body --silent --show-error \
         "content": "Explain indemnification clauses."
       }
     ],
-    "personality": "signloop-assistant",
     "stream": false
   }'
 ```
@@ -186,7 +183,6 @@ curl --no-buffer --fail-with-body --silent --show-error \
         "content": "What changed recently in EU AI regulation?"
       }
     ],
-    "personality": "bare-llm",
     "stream": true
   }'
 ```
@@ -226,7 +222,7 @@ The health check is intentionally unauthenticated and does not probe upstream pr
 
 For each accepted chat request, the service:
 
-1. Prepends the selected, server-owned personality prompt and authoritative current UTC context.
+1. Adds authoritative current UTC context without imposing an identity, tone, or behavioral persona.
 2. Runs exactly one Gemini-grounded Google research pass.
 3. Fails closed before generation if Gemini does not return grounded sources.
 4. Adds a bounded research brief to the latest user message as untrusted evidence with prompt-injection defenses.
