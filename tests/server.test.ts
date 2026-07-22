@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { InferenceSemaphore } from "../src/auth";
+import { InferenceSemaphore } from "../src/concurrency";
 import type { ServiceConfig } from "../src/config";
 import {
   createRequestHandler,
@@ -11,14 +11,12 @@ import type { ChatReply } from "../src/pipeline/chat";
 import { MAX_CHAT_REQUEST_BODY_BYTES } from "../src/pipeline/chat-policy";
 import { DEFAULT_CHAT_ERROR_MESSAGE } from "../src/prompts";
 
-const SERVICE_API_KEY = "service-secret";
 const TEST_URL = "http://service.test";
 
 function makeConfig(
   overrides: Partial<ServiceConfig> = {},
 ): ServiceConfig {
   return {
-    serviceApiKey: SERVICE_API_KEY,
     geminiApiKey: "gemini-secret-never-return",
     geminiSearchModel: "gemini-test-model",
     primaryLlm: {
@@ -61,7 +59,6 @@ function makePipeline(reply: ChatReply = makeReply()) {
 }
 
 type ChatRequestOptions = {
-  token?: string | null;
   contentType?: string | null;
   headers?: HeadersInit;
   signal?: AbortSignal;
@@ -72,12 +69,9 @@ function chatRequest(
   options: ChatRequestOptions = {},
 ): Request {
   const headers = new Headers(options.headers);
-  const token =
-    options.token === undefined ? SERVICE_API_KEY : options.token;
   const contentType =
     options.contentType === undefined ? "application/json" : options.contentType;
 
-  if (token !== null) headers.set("Authorization", `Bearer ${token}`);
   if (contentType !== null) headers.set("Content-Type", contentType);
 
   return new Request(`${TEST_URL}/v1/chat`, {
@@ -121,7 +115,6 @@ function hangingUploadRequest(options: {
   return new Request(`${TEST_URL}/v1/chat`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${SERVICE_API_KEY}`,
       "Content-Type": "application/json",
     },
     body,
@@ -134,8 +127,8 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("HTTP routing and service authentication", () => {
-  it("serves health without authentication or pipeline work", async () => {
+describe("HTTP routing", () => {
+  it("serves health without pipeline work", async () => {
     const { pipeline, generate, stream } = makePipeline();
     const handler = createRequestHandler({
       config: makeConfig(),
@@ -173,31 +166,7 @@ describe("HTTP routing and service authentication", () => {
     expect(wrongMethod.status).toBe(404);
   });
 
-  it("rejects missing and incorrect Bearer credentials before pipeline work", async () => {
-    const { pipeline, generate, stream } = makePipeline();
-    const handler = createRequestHandler({
-      config: makeConfig(),
-      pipeline,
-      log: vi.fn(),
-    });
-
-    const missing = await handler(
-      chatRequest(nonStreamingBody(), { token: null }),
-    );
-    const incorrect = await handler(
-      chatRequest(nonStreamingBody(), { token: "x" }),
-    );
-
-    for (const response of [missing, incorrect]) {
-      expect(response.status).toBe(401);
-      expect(response.headers.get("WWW-Authenticate")).toBe("Bearer");
-      await expect(response.json()).resolves.toEqual({ error: "Unauthorized" });
-    }
-    expect(generate).not.toHaveBeenCalled();
-    expect(stream).not.toHaveBeenCalled();
-  });
-
-  it("accepts the configured Bearer credential", async () => {
+  it("accepts chat requests without credentials", async () => {
     const { pipeline, generate } = makePipeline();
     const handler = createRequestHandler({
       config: makeConfig(),
@@ -287,7 +256,6 @@ describe("HTTP request parsing and policy", () => {
     const request = new Request(`${TEST_URL}/v1/chat`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${SERVICE_API_KEY}`,
         "Content-Type": "application/json",
       },
       body,
@@ -1048,7 +1016,7 @@ describe("CORS and request IDs", () => {
       "POST, OPTIONS",
     );
     expect(allowed.headers.get("Access-Control-Allow-Headers")).toBe(
-      "Authorization, Content-Type, X-Request-ID",
+      "Content-Type, X-Request-ID",
     );
     expect(allowed.headers.get("Access-Control-Max-Age")).toBe("600");
     expect(denied.status).toBe(404);

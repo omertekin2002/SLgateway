@@ -3,11 +3,7 @@
 
 import { randomUUID } from "node:crypto";
 
-import {
-  InferenceSemaphore,
-  hasValidServiceAuthorization,
-  type ReleaseSlot,
-} from "./auth";
+import { InferenceSemaphore, type ReleaseSlot } from "./concurrency";
 import {
   getServiceConfig,
   type ServiceConfig,
@@ -437,7 +433,7 @@ export function createRequestHandler(
       headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
       headers.set(
         "Access-Control-Allow-Headers",
-        "Authorization, Content-Type, X-Request-ID",
+        "Content-Type, X-Request-ID",
       );
       headers.set("Access-Control-Max-Age", "600");
       finishLog(204);
@@ -446,15 +442,6 @@ export function createRequestHandler(
 
     if (request.method !== "POST" || path !== "/v1/chat") {
       return respond({ error: "Not found" }, 404);
-    }
-
-    if (!hasValidServiceAuthorization(request, config.serviceApiKey)) {
-      return respond(
-        { error: "Unauthorized" },
-        401,
-        { "WWW-Authenticate": "Bearer" },
-        { errorClass: "AuthenticationError" },
-      );
     }
 
     const release = semaphore.tryAcquire();

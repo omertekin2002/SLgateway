@@ -17,7 +17,6 @@ export type OpenRouterConfig = Readonly<{
 }>;
 
 export type ServiceConfig = Readonly<{
-  serviceApiKey: string;
   geminiApiKey: string;
   geminiSearchModel: string;
   primaryLlm: PrimaryLlmConfig | null;
@@ -135,10 +134,6 @@ function parseCorsOrigins(raw: string | null): ReadonlySet<string> {
 export function loadServiceConfig(
   environment: Environment = process.env,
 ): ServiceConfig {
-  const serviceApiKey = credentialValue(
-    "SERVICE_API_KEY",
-    requiredValue(environment, "SERVICE_API_KEY"),
-  );
   const geminiApiKey = credentialValue(
     "GEMINI_API_KEY",
     requiredValue(environment, "GEMINI_API_KEY"),
@@ -196,7 +191,6 @@ export function loadServiceConfig(
   );
 
   return Object.freeze({
-    serviceApiKey,
     geminiApiKey,
     geminiSearchModel: parseGeminiSearchModel(
       optionalValue(environment, "GEMINI_SEARCH_MODEL") ??

@@ -5,7 +5,6 @@ import {
 } from "../src/config";
 
 const minimumEnvironment = {
-  SERVICE_API_KEY: "service-secret",
   GEMINI_API_KEY: "gemini-secret",
   OPENROUTER_API_KEY: "openrouter-secret",
 };
@@ -34,7 +33,6 @@ describe("loadServiceConfig", () => {
 
   it("supports a primary-only generation path", () => {
     const config = loadServiceConfig({
-      SERVICE_API_KEY: "service-secret",
       GEMINI_API_KEY: "gemini-secret",
       PRIMARY_LLM_BASE_URL: "https://primary.example.test/v1",
       PRIMARY_LLM_API_KEY: "primary-secret",
@@ -51,7 +49,6 @@ describe("loadServiceConfig", () => {
   it("requires at least one complete generation path", () => {
     expect(() =>
       loadServiceConfig({
-        SERVICE_API_KEY: "service-secret",
         GEMINI_API_KEY: "gemini-secret",
       }),
     ).toThrow(/generation|provider|OPENROUTER/i);
@@ -84,13 +81,6 @@ describe("loadServiceConfig", () => {
   });
 
   it("validates request-critical identifiers at startup", () => {
-    expect(() =>
-      loadServiceConfig({
-        ...minimumEnvironment,
-        SERVICE_API_KEY: "not usable as a bearer token",
-      }),
-    ).toThrow(/SERVICE_API_KEY.*whitespace/i);
-
     expect(() =>
       loadServiceConfig({
         ...minimumEnvironment,

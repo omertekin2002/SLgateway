@@ -1,6 +1,6 @@
 # SignLoop Chat Service
 
-A standalone, stateless, text-only HTTP extraction of SignLoop's chat-generation pipeline. It exposes a small authenticated chat API, performs Gemini-grounded Google research for every turn, and generates a response through a server-configured OpenAI-compatible provider with ordered OpenRouter fallback.
+A standalone, stateless, text-only HTTP extraction of SignLoop's chat-generation pipeline. It exposes a small public chat API, performs Gemini-grounded Google research for every turn, and generates a response through a server-configured OpenAI-compatible provider with ordered OpenRouter fallback.
 
 This repository contains no UI, Clerk integration, database, saved threads, uploads, or model selector. The service does not store conversations: callers must send the complete conversation history with every request.
 
@@ -9,7 +9,7 @@ This repository contains no UI, Clerk integration, database, saved threads, uplo
 ```text
 client
   -> Bun.serve HTTP boundary
-  -> Bearer authentication + per-process concurrency gate
+  -> per-process concurrency gate
   -> bounded JSON reader + conversation validation
   -> authoritative UTC time
   -> one Gemini-grounded Google research pass (required)
@@ -21,8 +21,8 @@ client
 
 The service has two routes:
 
-- `GET /healthz` is an unauthenticated process-liveness check. It does not contact Gemini or a generation provider.
-- `POST /v1/chat` is the authenticated chat endpoint. It supports non-streaming JSON and streaming NDJSON responses.
+- `GET /healthz` is a process-liveness check. It does not contact Gemini or a generation provider.
+- `POST /v1/chat` is the public chat endpoint. It supports non-streaming JSON and streaming NDJSON responses.
 
 The model and provider URLs are controlled only by server configuration. Clients cannot select an arbitrary model or provider.
 
@@ -50,7 +50,7 @@ bun install --frozen-lockfile
 cp .env.example .env
 ```
 
-Edit `.env` and provide `SERVICE_API_KEY`, `GEMINI_API_KEY`, and at least one generation path. A primary path requires both `PRIMARY_LLM_BASE_URL` and `PRIMARY_LLM_API_KEY`; alternatively, set `OPENROUTER_API_KEY`, or configure both for fallback.
+Edit `.env` and provide `GEMINI_API_KEY` and at least one generation path. A primary path requires both `PRIMARY_LLM_BASE_URL` and `PRIMARY_LLM_API_KEY`; alternatively, set `OPENROUTER_API_KEY`, or configure both for fallback.
 
 Run the static checks and unit tests, then start the service:
 
@@ -70,7 +70,6 @@ Configuration is validated once when the process starts. Secret values belong in
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `SERVICE_API_KEY` | Yes | — | Shared secret accepted as the `/v1/chat` Bearer token. Use a long, randomly generated value. |
 | `GEMINI_API_KEY` | Yes | — | Authenticates the mandatory Gemini-grounded Google research pass. |
 | `GEMINI_SEARCH_MODEL` | No | `gemini-2.5-flash` | Gemini model used for grounded research. |
 | `PRIMARY_LLM_BASE_URL` | Conditional | — | HTTP(S) base URL of the primary OpenAI-compatible Responses API. Must be set together with `PRIMARY_LLM_API_KEY`. |
@@ -90,18 +89,17 @@ Configuration is validated once when the process starts. Secret values belong in
 
 At least one generation path must be valid at startup. If both paths are configured, the primary is attempted first and OpenRouter is used only as described under [Research and provider fallback](#research-and-provider-fallback).
 
-## Authentication
+## Public access
 
-`POST /v1/chat` requires both headers:
+`POST /v1/chat` does not require an API key. Send only the JSON content type:
 
 ```http
-Authorization: Bearer <SERVICE_API_KEY>
 Content-Type: application/json
 ```
 
-Authentication is checked before the body is read or any provider work begins. Missing or invalid credentials return `401`; key comparison is timing-safe. The expected key, authorization header, provider credentials, and provider base URLs are never returned to clients.
+Provider credentials and provider base URLs remain server-controlled and are never returned to clients. Because every caller can initiate paid provider work, deploy behind an external rate limiter or access-control layer if the endpoint is exposed to untrusted traffic.
 
-CORS is a browser interoperability control, not authentication. Keep the Bearer key secret even when an origin allowlist is enabled.
+CORS is a browser interoperability control, not access control. Non-browser clients can call the endpoint regardless of the configured origin allowlist.
 
 ## Chat request
 
@@ -132,7 +130,6 @@ Request rules:
 ```sh
 curl --fail-with-body --silent --show-error \
   --request POST "http://localhost:10000/v1/chat" \
-  --header "Authorization: Bearer $SERVICE_API_KEY" \
   --header "Content-Type: application/json" \
   --data '{
     "messages": [
@@ -174,7 +171,6 @@ Use `--no-buffer` so `curl` prints each event as it arrives:
 ```sh
 curl --no-buffer --fail-with-body --silent --show-error \
   --request POST "http://localhost:10000/v1/chat" \
-  --header "Authorization: Bearer $SERVICE_API_KEY" \
   --header "Content-Type: application/json" \
   --data '{
     "messages": [
@@ -253,7 +249,7 @@ The body is read incrementally, so chunked transfer encoding cannot bypass the 1
 
 The concurrency gate is an in-memory semaphore and therefore applies **per process instance**, not globally. Horizontal scaling multiplies the effective capacity. Before accepting untrusted third-party traffic or enforcing account quotas across instances, put quota/rate enforcement in a shared datastore or API gateway. The service itself intentionally has no datastore.
 
-CORS is disabled by default. When `CORS_ALLOWED_ORIGINS` is set, only those exact origins are allowed; a wildcard is not accepted. CORS does not replace Bearer authentication and does not protect non-browser clients.
+CORS is disabled by default. When `CORS_ALLOWED_ORIGINS` is set, only those exact origins are allowed; a wildcard is not accepted. CORS does not protect the public endpoint from non-browser clients.
 
 ## Errors and request IDs
 
@@ -262,7 +258,6 @@ Errors returned before a stream opens use a safe JSON message and an appropriate
 | Status | Meaning |
 | ---: | --- |
 | `400` | Malformed JSON, invalid request fields or roles, empty messages, or a non-user final message. |
-| `401` | Missing or invalid Bearer credential. |
 | `404` | Unknown route. |
 | `413` | Request body, message, message count, or history limit exceeded. |
 | `415` | Request content type is not `application/json`. |
@@ -291,7 +286,7 @@ To deploy it as a [Render Blueprint](https://render.com/docs/infrastructure-as-c
 
 1. Push this repository to a Git host and create a new Blueprint in Render from that repository.
 2. Review the service generated from `render.yaml`.
-3. Enter secret values for the `sync: false` variables in Render. Set `SERVICE_API_KEY` and `GEMINI_API_KEY`, plus a complete primary provider pair, `OPENROUTER_API_KEY`, or both. Do not commit those values.
+3. Enter secret values for the `sync: false` variables in Render. Set `GEMINI_API_KEY`, plus a complete primary provider pair, `OPENROUTER_API_KEY`, or both. Do not commit those values.
 4. Apply the Blueprint and let Render run the declared build and start commands.
 5. Use the assigned external URL for the smoke requests below. Render supplies `PORT`, and the server binds to `0.0.0.0`.
 
@@ -305,20 +300,17 @@ With a local server running—or after substituting a deployed base URL—set va
 
 ```sh
 export CHAT_SERVICE_URL="http://localhost:10000"
-export SERVICE_API_KEY="replace-with-the-same-key-configured-on-the-service"
 
 curl --fail --silent --show-error \
   "$CHAT_SERVICE_URL/healthz"
 
 curl --fail-with-body --silent --show-error \
   --request POST "$CHAT_SERVICE_URL/v1/chat" \
-  --header "Authorization: Bearer $SERVICE_API_KEY" \
   --header "Content-Type: application/json" \
   --data '{"messages":[{"role":"user","content":"Reply with a one-sentence description of this service."}],"stream":false}'
 
 curl --no-buffer --fail-with-body --silent --show-error \
   --request POST "$CHAT_SERVICE_URL/v1/chat" \
-  --header "Authorization: Bearer $SERVICE_API_KEY" \
   --header "Content-Type: application/json" \
   --data '{"messages":[{"role":"user","content":"Reply with a one-sentence description of this service."}],"stream":true}'
 ```

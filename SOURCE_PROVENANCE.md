@@ -18,13 +18,13 @@ Every source file was read from that commit. No generated files, local environme
 | `apps/web/lib/gemini-search.ts` | `src/pipeline/gemini-search.ts` | Retains grounded Google research, source validation, bounded evidence, and prompt-injection defenses; accepts an explicit API key/model and abort signal. |
 | `apps/web/lib/chat-policy.ts` | `src/pipeline/chat-policy.ts` | Retains message/history/body limits, validation, incremental JSON parsing, and inline generated-image compaction. |
 | `apps/web/lib/chat-time.ts` | `src/pipeline/chat-time.ts` | Retains authoritative current UTC date/time context. |
-| `apps/web/app/api/chat/route.ts` | `src/prompts.ts`, `src/handler.ts` | Retains source-link attachment, safe errors, NDJSON events, and response metadata; removes chat identity prompts and replaces Next/Clerk/database behavior with service-key HTTP handling. |
+| `apps/web/app/api/chat/route.ts` | `src/prompts.ts`, `src/handler.ts` | Retains source-link attachment, safe errors, NDJSON events, and response metadata; removes chat identity prompts and replaces Next/Clerk/database behavior with a public HTTP boundary. |
 | `apps/web/lib/utils.ts` | `src/utils.ts` | Extracts only `isRecord` and `getErrorMessage`, avoiding UI dependencies. |
 | `apps/web/lib/chat.test.ts` | `tests/chat.test.ts` | Ports UTC, one-search, evidence reuse, fail-closed, delta, and streaming fallback coverage using injected providers. |
 | `apps/web/lib/chat-policy.test.ts` | `tests/chat-policy.test.ts` | Ports request/history limit, role validation, bounded-reader, and inline-image compaction coverage. |
 | `apps/web/lib/gemini-search.test.ts` | `tests/gemini-search.test.ts` | Ports grounded-response parsing, evidence safety, failure, timeout, cancellation, and redaction coverage. |
 | `apps/web/lib/llm-client.test.ts` | `tests/llm-client.test.ts` | Ports provider URL, response extraction, provider configuration, abort, and fallback-order coverage. |
 
-`src/config.ts`, `src/auth.ts`, `src/server.ts`, the standalone parts of `src/handler.ts`, and their HTTP/configuration tests are new service-specific code rather than copied application infrastructure.
+`src/config.ts`, `src/concurrency.ts`, `src/server.ts`, the standalone parts of `src/handler.ts`, and their HTTP/configuration tests are new service-specific code rather than copied application infrastructure.
 
 The Next.js and React UI, Clerk authentication, Postgres persistence, saved threads, model settings UI, contracts/projects/uploads, image generation, Vercel Blob, and all runtime database bootstrapping were intentionally excluded. The SignLoop source worktree was not modified during extraction.

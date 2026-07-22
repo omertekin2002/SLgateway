@@ -15,7 +15,6 @@ describe.skipIf(!runLiveTests)("live provider smoke test", () => {
         new Request("http://service.test/v1/chat", {
           method: "POST",
           headers: {
-            Authorization: `Bearer ${config.serviceApiKey}`,
             "Content-Type": "application/json",
           },
           body: JSON.stringify({

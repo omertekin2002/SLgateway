@@ -20,8 +20,6 @@ services:
         value: 4
       - key: REQUEST_TIMEOUT_MS
         value: 180000
-      - key: SERVICE_API_KEY
-        sync: false
       - key: GEMINI_API_KEY
         sync: false
       - key: PRIMARY_LLM_BASE_URL
