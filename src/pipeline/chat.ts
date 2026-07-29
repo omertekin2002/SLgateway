@@ -2,23 +2,35 @@ import OpenAI from "openai";
 
 import { buildAuthoritativeUtcTimeContext } from "./chat-time";
 import {
+  GeminiWebSearchError,
   prepareMessagesWithGeminiWebSearch,
   type WebSearchMetadata,
 } from "./gemini-search";
 import {
   OPENROUTER_MODELS,
+  GenerationUnavailableError,
+  ProviderHttpError,
+  createProviderExecutionScope,
   createOpenAiCompatibleClient,
   extractResponseOutputText,
+  isEligibleOpenRouterFallback,
+  safeProviderFailureMetadata,
   type FetchImplementation,
   type LlmFallbackLogger,
   type LlmProvider,
   type OpenAiCompatibleClientFactory,
   type OpenAiCompatibleClientOptions,
   type ProviderConfig,
+  type RunWithFallbackOptions,
   resolvePrimaryModel,
   runWithPrimaryAndOpenRouterFallback,
   validateProviderBaseUrl,
 } from "./llm-client";
+import { discoverPrimaryModelAvailability } from "./provider-models";
+import {
+  shouldResearchLatestUserMessage,
+  type ResearchMode,
+} from "./research-policy";
 
 // Adapted from SignLoop apps/web/lib/chat.ts.
 // Source commit: 5d06ed2630386c4a9af78373ce998d31dbc1f776
@@ -65,23 +77,21 @@ export type ChatDependencies = {
   readonly prepareWebSearch?: PrepareWebSearch;
   readonly now?: () => Date;
   readonly logger?: LlmFallbackLogger;
+  readonly discoverModel?: NonNullable<RunWithFallbackOptions["discoverModel"]>;
 };
 
 export type ChatGenerationOptions = {
   readonly providerConfig: ProviderConfig;
   readonly geminiSearch?: GeminiSearchConfig;
   readonly signal?: AbortSignal;
-  /** Search is a service invariant and defaults to true. Tests/internal callers may disable it. */
+  /** Public research policy. Defaults to auto. */
+  readonly researchMode?: ResearchMode;
+  /** @deprecated Internal compatibility switch. Prefer researchMode. */
   readonly enableWebSearch?: boolean;
   readonly dependencies?: ChatDependencies;
 };
 
 type ChatRequestOptions = { signal?: AbortSignal };
-
-function getErrorMessage(error: unknown): string {
-  if (error instanceof Error && error.message) return error.message;
-  return typeof error === "string" && error ? error : "Unknown error";
-}
 
 function getErrorClass(error: unknown): string {
   return error instanceof Error ? error.name || "Error" : typeof error;
@@ -97,6 +107,10 @@ function isAbortError(error: unknown, signal?: AbortSignal): boolean {
     error instanceof Error &&
     (error.name === "AbortError" || error.name === "APIUserAbortError")
   );
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
 }
 
 function toResponseInput(messages: readonly ChatMessage[]) {
@@ -134,17 +148,23 @@ function parseJsonRecord(value: string): Record<string, unknown> | null {
   }
 }
 
-function extractProviderErrorMessage(status: number, body: string): string {
+function extractProviderHttpError(
+  status: number,
+  body: string,
+  headers: Headers,
+): ProviderHttpError {
   const payload = parseJsonRecord(body);
   const error = isRecord(payload?.error) ? payload.error : null;
-  const message =
-    typeof error?.message === "string"
-      ? error.message
-      : typeof payload?.message === "string"
-        ? payload.message
-        : body.trim();
-
-  return `${status} ${message || "OpenRouter request failed"}`.slice(0, 1_200);
+  const safeMachineValue = (value: unknown): string | undefined => {
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    return /^[A-Za-z0-9_.:-]{1,128}$/u.test(trimmed) ? trimmed : undefined;
+  };
+  return new ProviderHttpError(
+    status,
+    safeMachineValue(error?.code) ?? safeMachineValue(payload?.code),
+    safeMachineValue(headers.get("x-request-id")),
+  );
 }
 
 function extractSseDataPayload(block: string): string | null {
@@ -266,7 +286,11 @@ export async function prepareChatMessages(
   messages: readonly ChatMessage[],
   options: Pick<
     ChatGenerationOptions,
-    "dependencies" | "enableWebSearch" | "geminiSearch" | "signal"
+    | "dependencies"
+    | "enableWebSearch"
+    | "geminiSearch"
+    | "researchMode"
+    | "signal"
   >,
 ): Promise<{
   messages: readonly ChatMessage[];
@@ -290,30 +314,66 @@ export async function prepareChatMessages(
     preparedMessages.unshift({ role: "system", content: timeContext });
   }
 
-  if (options.enableWebSearch === false) {
+  const researchMode =
+    options.researchMode ??
+    (options.enableWebSearch === false
+      ? "never"
+      : options.enableWebSearch === true
+        ? "always"
+        : "auto");
+  const shouldResearch =
+    researchMode === "always" ||
+    (researchMode === "auto" && shouldResearchLatestUserMessage(messages));
+
+  if (!shouldResearch) {
     return { messages: preparedMessages, webSearch: null };
   }
 
   if (!options.geminiSearch?.apiKey.trim()) {
-    throw new Error(
+    const error = new GeminiWebSearchError(
       "Gemini web search is not configured. A GEMINI_API_KEY is required.",
+      "Grounded research is temporarily unavailable.",
     );
+    if (researchMode === "always") throw error;
+    dependencies?.logger?.warn(
+      "Grounded research unavailable; continuing ungrounded",
+      {
+        event: "research_fallback",
+        errorClass: error.name,
+      },
+    );
+    return { messages: preparedMessages, webSearch: null };
   }
 
   const prepareWebSearch =
     dependencies?.prepareWebSearch ?? prepareMessagesWithGeminiWebSearch;
-  const prepared = await prepareWebSearch(preparedMessages, {
-    apiKey: options.geminiSearch.apiKey,
-    ...(options.geminiSearch.model
-      ? { model: options.geminiSearch.model }
-      : {}),
-    ...(options.geminiSearch.timeoutMs !== undefined
-      ? { timeoutMs: options.geminiSearch.timeoutMs }
-      : {}),
-    ...(dependencies?.fetch ? { fetch: dependencies.fetch } : {}),
-    ...(options.signal ? { signal: options.signal } : {}),
-    currentTime,
-  });
+  let prepared;
+  try {
+    prepared = await prepareWebSearch(preparedMessages, {
+      apiKey: options.geminiSearch.apiKey,
+      ...(options.geminiSearch.model
+        ? { model: options.geminiSearch.model }
+        : {}),
+      ...(options.geminiSearch.timeoutMs !== undefined
+        ? { timeoutMs: options.geminiSearch.timeoutMs }
+        : {}),
+      ...(dependencies?.fetch ? { fetch: dependencies.fetch } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+      currentTime,
+    });
+  } catch (error) {
+    if (isAbortError(error, options.signal)) throw error;
+    if (researchMode === "always") throw error;
+
+    dependencies?.logger?.warn(
+      "Grounded research unavailable; continuing ungrounded",
+      {
+        event: "research_fallback",
+        errorClass: getErrorClass(error),
+      },
+    );
+    return { messages: preparedMessages, webSearch: null };
+  }
 
   return {
     messages: prepared.messages,
@@ -329,19 +389,19 @@ export async function generateChatReply(
     throw new Error("No chat messages were provided");
   }
 
-  // Preparation occurs outside the fallback loop: grounded evidence is searched once,
-  // reused verbatim by every model, and a search failure prevents generation entirely.
+  // Preparation occurs outside the fallback loop: research runs at most once, and any valid
+  // grounded evidence is reused verbatim by every model.
   const prepared = await prepareChatMessages(messages, options);
   const dependencies = options.dependencies;
   const { result, provider, model } =
     await runWithPrimaryAndOpenRouterFallback(
       options.providerConfig,
-      (client, runModel) =>
+      (client, runModel, signal) =>
         runChatWithResponsesModel(
           client,
           runModel,
           prepared.messages,
-          requestOptions(options.signal),
+          requestOptions(signal),
         ),
       {
         ...(options.signal ? { signal: options.signal } : {}),
@@ -350,6 +410,9 @@ export async function generateChatReply(
           : {}),
         ...(dependencies?.fetch ? { fetch: dependencies.fetch } : {}),
         ...(dependencies?.logger ? { logger: dependencies.logger } : {}),
+        ...(dependencies?.discoverModel
+          ? { discoverModel: dependencies.discoverModel }
+          : {}),
       },
     );
 
@@ -470,8 +533,10 @@ async function* runOpenRouterResponsesModelStream(
   );
 
   if (!response.ok) {
-    throw new Error(
-      extractProviderErrorMessage(response.status, await response.text()),
+    throw extractProviderHttpError(
+      response.status,
+      await response.text(),
+      response.headers,
     );
   }
   if (!response.body) {
@@ -572,8 +637,8 @@ export async function* generateChatReplyStream(
     throw new Error("No chat messages were provided");
   }
 
-  // Search is deliberately completed before provider selection so it runs exactly once,
-  // is reused by every attempt, and fails closed before any model can answer ungrounded.
+  // Research is completed before provider selection so it runs at most once and any valid
+  // evidence is reused verbatim by every attempt.
   const prepared = await prepareChatMessages(messages, options);
   const config = options.providerConfig;
   const dependencies = options.dependencies;
@@ -581,135 +646,156 @@ export async function* generateChatReplyStream(
     dependencies?.createClient ?? createOpenAiCompatibleClient;
   const fetchImplementation = dependencies?.fetch ?? globalThis.fetch;
   const logger = dependencies?.logger ?? console;
-  let primaryError: unknown;
+  const scope = createProviderExecutionScope(options.signal, config.timeoutMs);
+  const failures = [] as ReturnType<typeof safeProviderFailureMetadata>[];
 
-  if (config.primary) {
-    const selectedPrimaryModel = resolvePrimaryModel(
-      undefined,
-      config.primary.model,
-    );
-    let primaryEmittedContent = false;
-
-    try {
-      const primaryClient = createClient(
-        config.primary.baseURL,
-        config.primary.apiKey,
-        clientOptions(config, dependencies?.fetch),
+  try {
+    if (config.primary) {
+      const selectedPrimaryModel = resolvePrimaryModel(
+        undefined,
+        config.primary.model,
       );
-      const message = yield* runPrimaryResponsesModelStream(
-        primaryClient,
-        selectedPrimaryModel,
-        prepared.messages,
-        requestOptions(options.signal),
-        () => {
-          primaryEmittedContent = true;
-        },
-      );
+      const discoverModel =
+        dependencies?.discoverModel ?? discoverPrimaryModelAvailability;
+      const availability = await discoverModel(config.primary, {
+        ...(dependencies?.fetch ? { fetch: dependencies.fetch } : {}),
+        signal: scope.signal,
+      });
 
-      yield {
-        type: "done",
-        reply: {
-          message,
-          provider: "primary-openai-compatible",
+      if (availability === "unavailable") {
+        const failure = {
+          provider: "primary-openai-compatible" as const,
           model: selectedPrimaryModel,
-          webSearch: prepared.webSearch,
-        },
-      };
-      return;
-    } catch (error) {
-      primaryError = error;
-      if (isAbortError(error, options.signal)) throw error;
+          errorClass: "ModelUnavailableError",
+          providerCode: "model_not_available",
+        };
+        failures.push(failure);
+        logger.warn("Configured primary model is not advertised by the provider", {
+          event: "provider_model_unavailable",
+          ...failure,
+        });
+      } else {
+        let primaryEmittedContent = false;
+        try {
+          const primaryClient = createClient(
+            config.primary.baseURL,
+            config.primary.apiKey,
+            clientOptions(config, dependencies?.fetch),
+          );
+          const message = yield* runPrimaryResponsesModelStream(
+            primaryClient,
+            selectedPrimaryModel,
+            prepared.messages,
+            requestOptions(scope.signal),
+            () => {
+              primaryEmittedContent = true;
+            },
+          );
 
-      const primaryErrorMessage = getErrorMessage(error);
-      if (primaryEmittedContent) {
-        throw new Error(
-          `Primary chat stream failed after response started: ${primaryErrorMessage}`,
-        );
+          yield {
+            type: "done",
+            reply: {
+              message,
+              provider: "primary-openai-compatible",
+              model: selectedPrimaryModel,
+              webSearch: prepared.webSearch,
+            },
+          };
+          return;
+        } catch (error) {
+          if (isAbortError(error, scope.signal)) {
+            throw scope.signal.aborted ? abortReason(scope.signal) : error;
+          }
+          if (primaryEmittedContent) {
+            throw new Error("Primary chat stream failed after response started");
+          }
+
+          const failure = safeProviderFailureMetadata(
+            "primary-openai-compatible",
+            selectedPrimaryModel,
+            error,
+          );
+          failures.push(failure);
+          logger.warn(
+            "Primary chat model failed, falling back to streaming OpenRouter",
+            { event: "provider_failure", ...failure },
+          );
+        }
       }
-
-      logger.warn(
-        "Primary chat model failed, falling back to streaming OpenRouter",
-        { model: selectedPrimaryModel, errorClass: getErrorClass(error) },
-      );
     }
-  }
 
-  const openRouter = config.openRouter;
-  if (!openRouter?.apiKey.trim()) {
-    if (primaryError) {
-      throw new Error(
-        `Primary chat model failed and OpenRouter fallback is not configured. Primary error: ${getErrorMessage(
-          primaryError,
-        )}`,
-      );
+    const openRouter = config.openRouter;
+    if (!openRouter?.apiKey.trim()) {
+      throw new GenerationUnavailableError(failures);
     }
-    throw new Error("No LLM generation provider is configured");
-  }
 
-  const fallbackModels = openRouterModels(config);
-  const fallbackFailures: string[] = [];
+    const fallbackModels = openRouterModels(config);
+    for (const fallbackModel of fallbackModels) {
+      let emittedFallbackContent = false;
 
-  for (const fallbackModel of fallbackModels) {
-    let emittedFallbackContent = false;
-
-    try {
-      const message = yield* runOpenRouterResponsesModelStream(
-        config,
-        fallbackModel,
-        prepared.messages,
-        fetchImplementation,
-        requestOptions(options.signal),
-        () => {
-          emittedFallbackContent = true;
-        },
-      );
-
-      if (fallbackModel !== fallbackModels[0]) {
-        logger.warn(
-          "OpenRouter chat fallback model succeeded after earlier model failed",
-          {
-            firstFallbackModel: fallbackModels[0],
-            successfulFallbackModel: fallbackModel,
+      try {
+        const message = yield* runOpenRouterResponsesModelStream(
+          config,
+          fallbackModel,
+          prepared.messages,
+          fetchImplementation,
+          requestOptions(scope.signal),
+          () => {
+            emittedFallbackContent = true;
           },
         );
-      }
 
-      yield {
-        type: "done",
-        reply: {
-          message,
-          provider: "openrouter",
-          model: fallbackModel,
-          webSearch: prepared.webSearch,
-        },
-      };
-      return;
-    } catch (error) {
-      if (isAbortError(error, options.signal)) throw error;
-      const fallbackErrorMessage = getErrorMessage(error);
+        if (fallbackModel !== fallbackModels[0]) {
+          logger.warn(
+            "OpenRouter chat fallback model succeeded after earlier model failed",
+            {
+              event: "provider_fallback_succeeded",
+              provider: "openrouter",
+              firstFallbackModel: fallbackModels[0],
+              successfulFallbackModel: fallbackModel,
+            },
+          );
+        }
 
-      // Restarting after any visible delta would duplicate/contradict the response already
-      // consumed by the client. Only pre-delta failures are eligible for another model.
-      if (emittedFallbackContent) {
-        throw new Error(
-          `OpenRouter chat stream failed after response started: ${fallbackErrorMessage}`,
+        yield {
+          type: "done",
+          reply: {
+            message,
+            provider: "openrouter",
+            model: fallbackModel,
+            webSearch: prepared.webSearch,
+          },
+        };
+        return;
+      } catch (error) {
+        if (isAbortError(error, scope.signal)) {
+          throw scope.signal.aborted ? abortReason(scope.signal) : error;
+        }
+
+        // Restarting after any visible delta would duplicate/contradict the response already
+        // consumed by the client. Only pre-delta failures are eligible for another model.
+        if (emittedFallbackContent) {
+          throw new Error("OpenRouter chat stream failed after response started");
+        }
+
+        const failure = safeProviderFailureMetadata(
+          "openrouter",
+          fallbackModel,
+          error,
         );
+        failures.push(failure);
+        logger.warn(
+          "OpenRouter chat fallback model failed before streaming content",
+          { event: "provider_failure", ...failure },
+        );
+        if (!isEligibleOpenRouterFallback(error)) {
+          throw new GenerationUnavailableError(failures);
+        }
       }
-
-      fallbackFailures.push(`${fallbackModel}: ${fallbackErrorMessage}`);
-      logger.warn(
-        "OpenRouter chat fallback model failed before streaming content",
-        { model: fallbackModel, errorClass: getErrorClass(error) },
-      );
     }
-  }
 
-  const primaryFailure = primaryError
-    ? `Primary chat model failed (${getErrorMessage(primaryError)}) and `
-    : "";
-  throw new Error(
-    `${primaryFailure}OpenRouter fallback failed (${fallbackFailures.join(
-      " | ",
-    )})`,
-  );
+    throw new GenerationUnavailableError(failures);
+  } finally {
+    scope.cleanup();
+  }
 }

@@ -9,6 +9,8 @@ import {
 } from "../src/handler";
 import type { ChatReply } from "../src/pipeline/chat";
 import { MAX_CHAT_REQUEST_BODY_BYTES } from "../src/pipeline/chat-policy";
+import { GeminiWebSearchError } from "../src/pipeline/gemini-search";
+import { GenerationUnavailableError } from "../src/pipeline/llm-client";
 import { DEFAULT_CHAT_ERROR_MESSAGE } from "../src/prompts";
 
 const TEST_URL = "http://service.test";
@@ -23,6 +25,7 @@ function makeConfig(
       baseUrl: "https://primary.internal.example/v1",
       apiKey: "primary-secret-never-return",
       model: "server-controlled-model",
+      modelWasDefaulted: false,
     },
     openRouter: null,
     publicServiceUrl: TEST_URL,
@@ -162,7 +165,10 @@ describe("HTTP routing", () => {
     );
 
     expect(unknown.status).toBe(404);
-    await expect(unknown.json()).resolves.toEqual({ error: "Not found" });
+    await expect(unknown.json()).resolves.toEqual({
+      error: "Not found",
+      code: "invalid_request",
+    });
     expect(wrongMethod.status).toBe(404);
   });
 
@@ -197,6 +203,7 @@ describe("HTTP request parsing and policy", () => {
     expect(response.status).toBe(415);
     await expect(response.json()).resolves.toEqual({
       error: "Content-Type must be application/json.",
+      code: "invalid_request",
     });
     expect(generate).not.toHaveBeenCalled();
   });
@@ -232,6 +239,7 @@ describe("HTTP request parsing and policy", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({
       error: "Invalid JSON body",
+      code: "invalid_request",
     });
     expect(generate).not.toHaveBeenCalled();
   });
@@ -274,6 +282,7 @@ describe("HTTP request parsing and policy", () => {
     expect(response.status).toBe(413);
     await expect(response.json()).resolves.toEqual({
       error: "Chat request body is too large.",
+      code: "invalid_request",
     });
     expect(generate).not.toHaveBeenCalled();
   });
@@ -330,6 +339,7 @@ describe("HTTP request parsing and policy", () => {
       expect(response.status).toBe(400);
       await expect(response.json()).resolves.toEqual({
         error: "The model and provider are controlled by the service.",
+        code: "invalid_request",
       });
       expect(generate).not.toHaveBeenCalled();
       expect(stream).not.toHaveBeenCalled();
@@ -367,9 +377,162 @@ describe("HTTP request parsing and policy", () => {
       { role: "user", content: question },
     ]);
   });
+
+  it.each(["auto", "always", "never"] as const)(
+    "accepts research mode %s and passes it to non-streaming generation",
+    async (researchMode) => {
+      const { pipeline, generate } = makePipeline();
+      const handler = createRequestHandler({
+        config: makeConfig(),
+        pipeline,
+        log: vi.fn(),
+      });
+
+      const response = await handler(
+        chatRequest(nonStreamingBody({ research: researchMode })),
+      );
+
+      expect(response.status).toBe(200);
+      expect(generate.mock.calls[0]?.[1]).toMatchObject({ researchMode });
+    },
+  );
+
+  it("defaults missing research to auto for streaming and non-streaming requests", async () => {
+    const { pipeline, generate, stream } = makePipeline();
+    const handler = createRequestHandler({
+      config: makeConfig(),
+      pipeline,
+      log: vi.fn(),
+    });
+
+    const nonStreamingResponse = await handler(chatRequest(nonStreamingBody()));
+    const streamingResponse = await handler(
+      chatRequest({ messages: [{ role: "user", content: "Hello" }] }),
+    );
+    const streamingEvents = parseNdjson(await streamingResponse.text());
+
+    expect(generate.mock.calls[0]?.[1]).toMatchObject({ researchMode: "auto" });
+    expect(stream.mock.calls[0]?.[1]).toMatchObject({ researchMode: "auto" });
+    await expect(nonStreamingResponse.json()).resolves.toMatchObject({
+      webSearch: null,
+      webSearchQuery: null,
+      webSources: [],
+    });
+    expect(streamingEvents.at(-1)).toMatchObject({
+      type: "done",
+      webSearch: null,
+      webSearchQuery: null,
+      webSources: [],
+    });
+  });
+
+  it("rejects invalid research values before pipeline work", async () => {
+    const { pipeline, generate, stream } = makePipeline();
+    const handler = createRequestHandler({
+      config: makeConfig(),
+      pipeline,
+      log: vi.fn(),
+      requestIdFactory: () => "invalid-research-request",
+    });
+
+    const response = await handler(
+      chatRequest(nonStreamingBody({ research: "sometimes" })),
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.headers.get("X-Request-ID")).toBe("invalid-research-request");
+    await expect(response.json()).resolves.toEqual({
+      error: "research must be one of: auto, always, never.",
+      code: "invalid_request",
+    });
+    expect(generate).not.toHaveBeenCalled();
+    expect(stream).not.toHaveBeenCalled();
+  });
 });
 
 describe("HTTP response contracts", () => {
+  it("distinguishes strict research failure from generation exhaustion", async () => {
+    const researchHandler = createRequestHandler({
+      config: makeConfig(),
+      pipeline: {
+        generate: vi.fn<ChatPipeline["generate"]>(async () => {
+          throw new GeminiWebSearchError(
+            "private upstream research failure",
+            "ignored public message",
+          );
+        }),
+        stream: vi.fn<ChatPipeline["stream"]>(),
+      },
+      log: vi.fn(),
+      requestIdFactory: () => "research-failure-id",
+    });
+    const generationHandler = createRequestHandler({
+      config: makeConfig(),
+      pipeline: {
+        generate: vi.fn<ChatPipeline["generate"]>(async () => {
+          throw new GenerationUnavailableError([]);
+        }),
+        stream: vi.fn<ChatPipeline["stream"]>(),
+      },
+      log: vi.fn(),
+      requestIdFactory: () => "generation-failure-id",
+    });
+
+    const researchResponse = await researchHandler(
+      chatRequest(nonStreamingBody({ research: "always" })),
+    );
+    const generationResponse = await generationHandler(
+      chatRequest(nonStreamingBody({ research: "never" })),
+    );
+
+    expect(researchResponse.status).toBe(502);
+    expect(researchResponse.headers.get("X-Request-ID")).toBe(
+      "research-failure-id",
+    );
+    await expect(researchResponse.json()).resolves.toEqual({
+      error: "Grounded research is temporarily unavailable.",
+      code: "research_unavailable",
+    });
+    expect(generationResponse.status).toBe(502);
+    await expect(generationResponse.json()).resolves.toEqual({
+      error: DEFAULT_CHAT_ERROR_MESSAGE,
+      code: "generation_unavailable",
+    });
+  });
+
+  it("uses the same strict research error code after a stream opens", async () => {
+    const handler = createRequestHandler({
+      config: makeConfig(),
+      pipeline: {
+        generate: vi.fn<ChatPipeline["generate"]>(),
+        stream: vi.fn<ChatPipeline["stream"]>(async function* () {
+          throw new GeminiWebSearchError(
+            "private upstream research failure",
+            "ignored public message",
+          );
+          yield undefined as never;
+        }),
+      },
+      log: vi.fn(),
+    });
+
+    const response = await handler(
+      chatRequest({
+        messages: [{ role: "user", content: "Find current sources." }],
+        research: "always",
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(parseNdjson(await response.text())).toEqual([
+      {
+        type: "error",
+        error: "Grounded research is temporarily unavailable.",
+        code: "research_unavailable",
+      },
+    ]);
+  });
+
   it("returns canonical non-streaming content with documented metadata", async () => {
     const reply = makeReply({
       message:
@@ -412,6 +575,7 @@ describe("HTTP response contracts", () => {
         "Answer with an existing [first citation](<https://one.example.test/source>).\n\nSources:\n2. [Second source](<https://two.example.test/source>)",
       provider: "openrouter",
       model: "fallback-model",
+      webSearch: reply.webSearch,
       webSearchQuery: "indemnity clause law",
       webSearchAttempts: ["indemnity clause", "indemnity clause law"],
       webSearchSuccessfulCount: 1,
@@ -474,6 +638,7 @@ describe("HTTP response contracts", () => {
           "Complete canonical answer\n\nSources:\n1. [Authoritative source](<https://source.example.test/rule>)",
         provider: "primary-openai-compatible",
         model: "server-controlled-model",
+        webSearch: reply.webSearch,
         webSearchQuery: "current contract rule",
         webSearchAttempts: ["current contract rule"],
         webSearchSuccessfulCount: 1,
@@ -512,7 +677,11 @@ describe("HTTP response contracts", () => {
 
     expect(events).toEqual([
       { type: "delta", text: "partial" },
-      { type: "error", error: "Chat stream ended before completion." },
+      {
+        type: "error",
+        error: "Chat stream ended before completion.",
+        code: "generation_unavailable",
+      },
     ]);
     expect(events.at(-1)?.type).toBe("error");
   });
@@ -548,6 +717,7 @@ describe("HTTP response contracts", () => {
     expect(nonStreamingResponse.status).toBe(502);
     expect(JSON.parse(nonStreamingText)).toEqual({
       error: DEFAULT_CHAT_ERROR_MESSAGE,
+      code: "generation_unavailable",
     });
 
     const streamingHandler = createRequestHandler({
@@ -569,7 +739,11 @@ describe("HTTP response contracts", () => {
     const streamingText = await streamingResponse.text();
 
     expect(parseNdjson(streamingText)).toEqual([
-      { type: "error", error: DEFAULT_CHAT_ERROR_MESSAGE },
+      {
+        type: "error",
+        error: DEFAULT_CHAT_ERROR_MESSAGE,
+        code: "generation_unavailable",
+      },
     ]);
     const publicOutput = `${nonStreamingText}\n${streamingText}\n${JSON.stringify(
       nonStreamingLogs,
@@ -605,6 +779,7 @@ describe("timeouts, cancellation, and concurrency", () => {
     expect(response.status).toBe(504);
     await expect(response.json()).resolves.toEqual({
       error: "Chat request timed out. Please try again.",
+      code: "request_timeout",
     });
     expect(cancelBody).toHaveBeenCalledOnce();
     expect((cancelBody.mock.calls[0]?.[0] as DOMException).name).toBe(
@@ -642,6 +817,7 @@ describe("timeouts, cancellation, and concurrency", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toEqual({
       error: "Request was aborted.",
+      code: "invalid_request",
     });
     expect(cancelBody).toHaveBeenCalledOnce();
     expect((cancelBody.mock.calls[0]?.[0] as DOMException).name).toBe(
@@ -702,7 +878,11 @@ describe("timeouts, cancellation, and concurrency", () => {
     await vi.advanceTimersByTimeAsync(25);
 
     expect(parseNdjson(await bodyPromise)).toEqual([
-      { type: "error", error: "Chat request timed out. Please try again." },
+      {
+        type: "error",
+        error: "Chat request timed out. Please try again.",
+        code: "request_timeout",
+      },
     ]);
     expect(semaphore.active).toBe(0);
   });
@@ -747,6 +927,7 @@ describe("timeouts, cancellation, and concurrency", () => {
     expect(response.status).toBe(504);
     await expect(response.json()).resolves.toEqual({
       error: "Chat request timed out. Please try again.",
+      code: "request_timeout",
     });
     expect(semaphore.active).toBe(0);
   });
@@ -796,6 +977,7 @@ describe("timeouts, cancellation, and concurrency", () => {
       {
         type: "error",
         error: "Chat request timed out. Please try again.",
+        code: "request_timeout",
       },
     ]);
     expect(semaphore.active).toBe(0);
@@ -857,7 +1039,11 @@ describe("timeouts, cancellation, and concurrency", () => {
     );
 
     expect(parseNdjson(await response.text())).toEqual([
-      { type: "error", error: DEFAULT_CHAT_ERROR_MESSAGE },
+      {
+        type: "error",
+        error: DEFAULT_CHAT_ERROR_MESSAGE,
+        code: "generation_unavailable",
+      },
     ]);
     expect(semaphore.active).toBe(0);
   });
@@ -926,6 +1112,7 @@ describe("timeouts, cancellation, and concurrency", () => {
     expect(response.headers.get("Retry-After")).toBe("1");
     await expect(response.json()).resolves.toEqual({
       error: "Too many concurrent chat requests. Please retry shortly.",
+      code: "service_busy",
     });
     expect(generate).not.toHaveBeenCalled();
     expect(stream).not.toHaveBeenCalled();

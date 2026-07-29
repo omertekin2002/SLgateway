@@ -7,10 +7,11 @@ import {
   type ChatMessage,
   type ChatReplyStreamChunk,
 } from "../src/pipeline/chat";
-import type {
-  GeminiSearchMessage,
-  GeminiWebSearchOptions,
-  PreparedGeminiWebSearch,
+import {
+  GeminiWebSearchError,
+  type GeminiSearchMessage,
+  type GeminiWebSearchOptions,
+  type PreparedGeminiWebSearch,
 } from "../src/pipeline/gemini-search";
 import type {
   FetchImplementation,
@@ -51,6 +52,10 @@ const fullProviderConfig: ProviderConfig = {
   appName: "SignLoop Chat Service",
   timeoutMs: 60_000,
 };
+
+async function unknownModelDiscovery() {
+  return "unknown" as const;
+}
 
 function asOpenAi(create: ReturnType<typeof vi.fn>): OpenAI {
   return { responses: { create } } as unknown as OpenAI;
@@ -97,7 +102,11 @@ describe("generateChatReply", () => {
         openRouter: undefined,
       },
       enableWebSearch: false,
-      dependencies: { createClient, now: () => fixedNow },
+      dependencies: {
+        createClient,
+        discoverModel: unknownModelDiscovery,
+        now: () => fixedNow,
+      },
     });
 
     const input = create.mock.calls[0]?.[0]?.input as ChatMessage[];
@@ -127,6 +136,7 @@ describe("generateChatReply", () => {
       enableWebSearch: false,
       dependencies: {
         createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
+        discoverModel: unknownModelDiscovery,
         now: () => fixedNow,
       },
     });
@@ -156,6 +166,7 @@ describe("generateChatReply", () => {
 
     const reply = await generateChatReply(originalMessages, {
       providerConfig: fullProviderConfig,
+      researchMode: "always",
       geminiSearch: {
         apiKey: "gemini-key",
         model: "gemini-search-model",
@@ -163,6 +174,7 @@ describe("generateChatReply", () => {
       },
       dependencies: {
         createClient,
+        discoverModel: unknownModelDiscovery,
         prepareWebSearch,
         now: () => fixedNow,
         logger: { warn: vi.fn() },
@@ -187,8 +199,115 @@ describe("generateChatReply", () => {
     });
   });
 
-  it("fails closed before model invocation when search fails or is unconfigured", async () => {
-    const createClient = vi.fn();
+  it("auto skips research for ordinary instructions", async () => {
+    const create = vi.fn().mockResolvedValue({ output_text: "diagnostic ok" });
+    const prepareWebSearch = searchPreparer();
+
+    const reply = await generateChatReply(
+      [{ role: "user", content: "Reply with exactly: diagnostic ok." }],
+      {
+        providerConfig: { ...fullProviderConfig, openRouter: undefined },
+        geminiSearch: { apiKey: "gemini-key" },
+        dependencies: {
+          createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
+          discoverModel: unknownModelDiscovery,
+          prepareWebSearch,
+        },
+      },
+    );
+
+    expect(prepareWebSearch).not.toHaveBeenCalled();
+    expect(reply.webSearch).toBeNull();
+  });
+
+  it("auto searches explicit current and source requests", async () => {
+    const create = vi.fn().mockResolvedValue({ output_text: "Current answer" });
+    const prepareWebSearch = searchPreparer();
+
+    const reply = await generateChatReply(
+      [{ role: "user", content: "What is the latest rule? Cite sources." }],
+      {
+        providerConfig: { ...fullProviderConfig, openRouter: undefined },
+        geminiSearch: { apiKey: "gemini-key" },
+        dependencies: {
+          createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
+          discoverModel: unknownModelDiscovery,
+          prepareWebSearch,
+        },
+      },
+    );
+
+    expect(prepareWebSearch).toHaveBeenCalledOnce();
+    expect(reply.webSearch).toEqual(searchMetadata);
+  });
+
+  it("auto falls through on invalid or transient research without injecting it", async () => {
+    const create = vi.fn().mockResolvedValue({ output_text: "Ungrounded answer" });
+    const createClient = (() => asOpenAi(create)) as OpenAiCompatibleClientFactory;
+    const searchError = new Error("Gemini search unavailable");
+    const prepareWebSearch = searchPreparer(async () => {
+      throw searchError;
+    });
+    const logger = { warn: vi.fn() };
+
+    const reply = await generateChatReply(
+      [{ role: "user", content: "Find current sources for this rule." }],
+      {
+        providerConfig: { ...fullProviderConfig, openRouter: undefined },
+        geminiSearch: { apiKey: "gemini-key" },
+        dependencies: {
+          createClient,
+          discoverModel: unknownModelDiscovery,
+          prepareWebSearch,
+          logger,
+        },
+      },
+    );
+
+    expect(reply.webSearch).toBeNull();
+    expect(create).toHaveBeenCalledOnce();
+    const generationInput = create.mock.calls[0]?.[0]?.input as ChatMessage[];
+    expect(JSON.stringify(generationInput)).not.toContain(
+      "BEGIN_APPLICATION_WEB_RESEARCH_JSON",
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ event: "research_fallback" }),
+    );
+  });
+
+  it("auto falls through when Gemini returns no valid sources", async () => {
+    const create = vi.fn().mockResolvedValue({ output_text: "Ungrounded answer" });
+    const prepareWebSearch = searchPreparer(async () => {
+      throw new GeminiWebSearchError(
+        "Gemini web search returned no valid web sources",
+        "Grounded research is temporarily unavailable.",
+      );
+    });
+
+    const reply = await generateChatReply(
+      [{ role: "user", content: "Find current sources for this rule." }],
+      {
+        providerConfig: { ...fullProviderConfig, openRouter: undefined },
+        geminiSearch: { apiKey: "gemini-key" },
+        dependencies: {
+          createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
+          discoverModel: unknownModelDiscovery,
+          prepareWebSearch,
+          logger: { warn: vi.fn() },
+        },
+      },
+    );
+
+    expect(reply.webSearch).toBeNull();
+    expect(JSON.stringify(create.mock.calls[0]?.[0]?.input)).not.toContain(
+      "BEGIN_APPLICATION_WEB_RESEARCH_JSON",
+    );
+  });
+
+  it("always fails closed while never bypasses Gemini", async () => {
+    const create = vi.fn().mockResolvedValue({ output_text: "Plain answer" });
+    const createClient = (() => asOpenAi(create)) as OpenAiCompatibleClientFactory;
     const searchError = new Error("Gemini search unavailable");
     const prepareWebSearch = searchPreparer(async () => {
       throw searchError;
@@ -196,20 +315,49 @@ describe("generateChatReply", () => {
 
     await expect(
       generateChatReply(originalMessages, {
-        providerConfig: fullProviderConfig,
+        providerConfig: { ...fullProviderConfig, openRouter: undefined },
+        researchMode: "always",
         geminiSearch: { apiKey: "gemini-key" },
         dependencies: { createClient, prepareWebSearch },
       }),
     ).rejects.toBe(searchError);
-    expect(createClient).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
 
-    await expect(
-      generateChatReply(originalMessages, {
-        providerConfig: fullProviderConfig,
-        dependencies: { createClient },
-      }),
-    ).rejects.toThrow(/Gemini web search is not configured/i);
-    expect(createClient).not.toHaveBeenCalled();
+    const reply = await generateChatReply(originalMessages, {
+      providerConfig: { ...fullProviderConfig, openRouter: undefined },
+      researchMode: "never",
+      geminiSearch: { apiKey: "gemini-key" },
+      dependencies: {
+        createClient,
+        discoverModel: unknownModelDiscovery,
+        prepareWebSearch,
+      },
+    });
+    expect(reply.webSearch).toBeNull();
+    expect(prepareWebSearch).toHaveBeenCalledOnce();
+  });
+
+  it("never swallows request aborts or timeout aborts", async () => {
+    for (const name of ["AbortError", "TimeoutError"] as const) {
+      const controller = new AbortController();
+      const reason = new DOMException("request ended", name);
+      controller.abort(reason);
+      const prepareWebSearch = searchPreparer(async () => {
+        throw reason;
+      });
+
+      await expect(
+        generateChatReply(
+          [{ role: "user", content: "Find current sources." }],
+          {
+            providerConfig: fullProviderConfig,
+            geminiSearch: { apiKey: "gemini-key" },
+            signal: controller.signal,
+            dependencies: { createClient: vi.fn(), prepareWebSearch },
+          },
+        ),
+      ).rejects.toBe(reason);
+    }
   });
 });
 
@@ -226,9 +374,11 @@ describe("generateChatReplyStream", () => {
     const chunks = await collectStream(
       generateChatReplyStream(originalMessages, {
         providerConfig: fullProviderConfig,
+        researchMode: "always",
         geminiSearch: { apiKey: "gemini-key" },
         dependencies: {
           createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
+          discoverModel: unknownModelDiscovery,
           prepareWebSearch,
           now: () => fixedNow,
         },
@@ -294,9 +444,11 @@ describe("generateChatReplyStream", () => {
     const chunks = await collectStream(
       generateChatReplyStream(originalMessages, {
         providerConfig: fullProviderConfig,
+        researchMode: "always",
         geminiSearch: { apiKey: "gemini-key" },
         dependencies: {
           createClient,
+          discoverModel: unknownModelDiscovery,
           fetch: fetchMock,
           prepareWebSearch,
           now: () => fixedNow,
@@ -341,6 +493,7 @@ describe("generateChatReplyStream", () => {
               asOpenAi(
                 vi.fn().mockResolvedValue(failingStream()),
               )) as OpenAiCompatibleClientFactory,
+            discoverModel: unknownModelDiscovery,
             fetch: fetchMock,
             logger: { warn: vi.fn() },
           },
@@ -372,6 +525,7 @@ describe("generateChatReplyStream", () => {
               asOpenAi(
                 vi.fn().mockResolvedValue(truncatedStream()),
               )) as OpenAiCompatibleClientFactory,
+            discoverModel: unknownModelDiscovery,
             fetch: fetchMock,
             logger: { warn: vi.fn() },
           },

@@ -3,6 +3,17 @@ import { handleRequest } from "./handler";
 
 const config = getServiceConfig();
 
+if (config.primaryLlm?.modelWasDefaulted) {
+  console.warn(
+    JSON.stringify({
+      level: "warn",
+      event: "primary_model_defaulted",
+      provider: "primary-openai-compatible",
+      model: config.primaryLlm.model,
+    }),
+  );
+}
+
 Bun.serve({
   hostname: "0.0.0.0",
   port: config.port,

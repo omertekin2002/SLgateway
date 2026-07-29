@@ -21,7 +21,14 @@ import {
   parseClientChatMessages,
 } from "./pipeline/chat-policy";
 import { GeminiWebSearchError } from "./pipeline/gemini-search";
-import type { ProviderConfig } from "./pipeline/llm-client";
+import {
+  GenerationUnavailableError,
+  type ProviderConfig,
+} from "./pipeline/llm-client";
+import {
+  parseResearchMode,
+  type ResearchMode,
+} from "./pipeline/research-policy";
 import {
   DEFAULT_CHAT_ERROR_MESSAGE,
   appendWebSourcesToMessage,
@@ -37,6 +44,7 @@ const TIMEOUT_ERROR = "Chat request timed out. Please try again.";
 export type PipelineRequestOptions = Readonly<{
   signal: AbortSignal;
   requestId: string;
+  researchMode: ResearchMode;
 }>;
 
 export type ChatPipeline = Readonly<{
@@ -211,28 +219,67 @@ function createConfiguredPipeline(
   const providerConfig = toProviderConfig(config);
   const optionsFor = (options: PipelineRequestOptions) => ({
     providerConfig,
-    geminiSearch: {
-      apiKey: config.geminiApiKey,
-      model: config.geminiSearchModel,
-    },
+    ...(config.geminiApiKey
+      ? {
+          geminiSearch: {
+            apiKey: config.geminiApiKey,
+            model: config.geminiSearchModel,
+          },
+        }
+      : {}),
     signal: options.signal,
+    researchMode: options.researchMode,
     dependencies: {
       // Pipeline warnings contain only fixed event text and whitelisted model metadata. Upstream
       // bodies, URLs, credentials, and prompts are deliberately discarded at this boundary.
       logger: {
-        warn(message: unknown, details?: unknown) {
+        warn(_message: unknown, details?: unknown) {
           const metadata = isRecord(details) ? details : {};
-          const models = [
-            metadata.model,
-            metadata.firstFallbackModel,
-            metadata.successfulFallbackModel,
-          ].filter((value): value is string => typeof value === "string");
+          const safeString = (value: unknown, maximum = 200) =>
+            typeof value === "string" &&
+            value.length <= maximum &&
+            /^[A-Za-z0-9_.:/-]+$/u.test(value)
+              ? value
+              : undefined;
+          const safeEvent = [
+            "provider_failure",
+            "provider_model_unavailable",
+            "provider_fallback_succeeded",
+            "research_fallback",
+          ].includes(String(metadata.event))
+            ? String(metadata.event)
+            : "provider_fallback";
+          const statusCode =
+            typeof metadata.statusCode === "number" &&
+            Number.isInteger(metadata.statusCode) &&
+            metadata.statusCode >= 100 &&
+            metadata.statusCode <= 599
+              ? metadata.statusCode
+              : undefined;
           log({
             level: "warn",
-            event: "provider_fallback",
+            event: safeEvent,
             requestId: options.requestId,
-            note: typeof message === "string" ? message : "Provider fallback",
-            ...(models.length ? { models } : {}),
+            ...(safeString(metadata.provider)
+              ? { provider: metadata.provider }
+              : {}),
+            ...(safeString(metadata.model) ? { model: metadata.model } : {}),
+            ...(safeString(metadata.errorClass, 100)
+              ? { errorClass: metadata.errorClass }
+              : {}),
+            ...(statusCode !== undefined ? { statusCode } : {}),
+            ...(safeString(metadata.providerCode, 100)
+              ? { providerCode: metadata.providerCode }
+              : {}),
+            ...(safeString(metadata.upstreamRequestId, 128)
+              ? { upstreamRequestId: metadata.upstreamRequestId }
+              : {}),
+            ...(safeString(metadata.firstFallbackModel)
+              ? { firstFallbackModel: metadata.firstFallbackModel }
+              : {}),
+            ...(safeString(metadata.successfulFallbackModel)
+              ? { successfulFallbackModel: metadata.successfulFallbackModel }
+              : {}),
           });
         },
       },
@@ -304,6 +351,7 @@ function replyMetadata(reply: ChatReply): Record<string, unknown> {
   return {
     provider: reply.provider,
     model: reply.model,
+    webSearch: reply.webSearch,
     webSearchQuery: reply.webSearch?.query ?? null,
     webSearchAttempts: reply.webSearch?.attemptedQueries ?? [],
     webSearchSuccessfulCount: reply.webSearch?.successfulSearches ?? 0,
@@ -314,14 +362,33 @@ function replyMetadata(reply: ChatReply): Record<string, unknown> {
 function publicPipelineError(
   error: unknown,
   scope: ExecutionScope,
-): { status: 502 | 504; message: string } {
+): {
+  status: 502 | 504;
+  message: string;
+  code: "research_unavailable" | "generation_unavailable" | "request_timeout";
+} {
   if (scope.timedOut) {
-    return { status: 504, message: TIMEOUT_ERROR };
+    return { status: 504, message: TIMEOUT_ERROR, code: "request_timeout" };
   }
   if (error instanceof GeminiWebSearchError) {
-    return { status: 502, message: error.publicMessage };
+    return {
+      status: 502,
+      message: "Grounded research is temporarily unavailable.",
+      code: "research_unavailable",
+    };
   }
-  return { status: 502, message: DEFAULT_CHAT_ERROR_MESSAGE };
+  if (error instanceof GenerationUnavailableError) {
+    return {
+      status: 502,
+      message: DEFAULT_CHAT_ERROR_MESSAGE,
+      code: "generation_unavailable",
+    };
+  }
+  return {
+    status: 502,
+    message: DEFAULT_CHAT_ERROR_MESSAGE,
+    code: "generation_unavailable",
+  };
 }
 
 function isJsonContentType(request: Request): boolean {
@@ -419,6 +486,20 @@ export function createRequestHandler(
       );
     };
 
+    const respondError = (
+      error: string,
+      code:
+        | "invalid_request"
+        | "research_unavailable"
+        | "generation_unavailable"
+        | "request_timeout"
+        | "service_busy",
+      status: number,
+      extraHeaders?: Readonly<Record<string, string>>,
+      logExtra?: Record<string, unknown>,
+    ): Response =>
+      respond({ error, code }, status, extraHeaders, logExtra);
+
     if (request.method === "GET" && path === "/healthz") {
       return respond({ ok: true, service: SERVICE_NAME }, 200);
     }
@@ -426,7 +507,7 @@ export function createRequestHandler(
     if (request.method === "OPTIONS" && path === "/v1/chat") {
       const origin = request.headers.get("origin");
       if (!origin || !config.corsAllowedOrigins.has(origin)) {
-        return respond({ error: "Not found" }, 404);
+        return respondError("Not found", "invalid_request", 404);
       }
 
       const headers = responseHeaders(request, config, requestId);
@@ -441,13 +522,14 @@ export function createRequestHandler(
     }
 
     if (request.method !== "POST" || path !== "/v1/chat") {
-      return respond({ error: "Not found" }, 404);
+      return respondError("Not found", "invalid_request", 404);
     }
 
     const release = semaphore.tryAcquire();
     if (!release) {
-      return respond(
-        { error: "Too many concurrent chat requests. Please retry shortly." },
+      return respondError(
+        "Too many concurrent chat requests. Please retry shortly.",
+        "service_busy",
         429,
         { "Retry-After": "1" },
         { errorClass: "ConcurrencyLimitError" },
@@ -459,14 +541,19 @@ export function createRequestHandler(
 
     try {
       if (!isJsonContentType(request)) {
-        return respond(
-          { error: "Content-Type must be application/json." },
+        return respondError(
+          "Content-Type must be application/json.",
+          "invalid_request",
           415,
         );
       }
 
       if (declaredBodyTooLarge(request)) {
-        return respond({ error: "Chat request body is too large." }, 413);
+        return respondError(
+          "Chat request body is too large.",
+          "invalid_request",
+          413,
+        );
       }
 
       const parsedBody = await parseBoundedJsonRequest<unknown>(
@@ -475,41 +562,61 @@ export function createRequestHandler(
         scope.signal,
       );
       if (scope.timedOut) {
-        return respond(
-          { error: TIMEOUT_ERROR },
+        return respondError(
+          TIMEOUT_ERROR,
+          "request_timeout",
           504,
           undefined,
           { errorClass: "TimeoutError" },
         );
       }
       if (!parsedBody.ok) {
-        return respond(
-          { error: parsedBody.error },
+        return respondError(
+          parsedBody.error,
+          "invalid_request",
           parsedBody.status,
         );
       }
 
       const parsedMessages = parseClientChatMessages(parsedBody.value);
       if (!parsedMessages.ok) {
-        return respond(
-          { error: parsedMessages.error },
+        return respondError(
+          parsedMessages.error,
+          "invalid_request",
           parsedMessages.status,
         );
       }
       if (!isRecord(parsedBody.value)) {
-        return respond({ error: "Request body must be an object." }, 400);
+        return respondError(
+          "Request body must be an object.",
+          "invalid_request",
+          400,
+        );
       }
       const body = parsedBody.value;
       if (hasClientProviderSelection(body)) {
-        return respond(
-          { error: "The model and provider are controlled by the service." },
+        return respondError(
+          "The model and provider are controlled by the service.",
+          "invalid_request",
           400,
         );
       }
 
       const streaming = parseStreaming(body);
       if (streaming === null) {
-        return respond({ error: "stream must be a boolean." }, 400);
+        return respondError(
+          "stream must be a boolean.",
+          "invalid_request",
+          400,
+        );
+      }
+      const researchMode = parseResearchMode(body.research);
+      if (researchMode === null) {
+        return respondError(
+          "research must be one of: auto, always, never.",
+          "invalid_request",
+          400,
+        );
       }
 
       context.streaming = streaming;
@@ -522,6 +629,7 @@ export function createRequestHandler(
       const pipelineOptions: PipelineRequestOptions = {
         signal: scope.signal,
         requestId,
+        researchMode,
       };
 
       if (!streaming) {
@@ -533,16 +641,18 @@ export function createRequestHandler(
           );
         } catch (error) {
           const publicError = publicPipelineError(error, scope);
-          return respond(
-            { error: publicError.message },
+          return respondError(
+            publicError.message,
+            publicError.code,
             publicError.status,
             undefined,
             { errorClass: safeErrorClass(error) },
           );
         }
         if (scope.timedOut) {
-          return respond(
-            { error: TIMEOUT_ERROR },
+          return respondError(
+            TIMEOUT_ERROR,
+            "request_timeout",
             504,
             undefined,
             { errorClass: "TimeoutError" },
@@ -615,7 +725,15 @@ export function createRequestHandler(
 
             if (!terminalEventSent && !scope.cancelled) {
               const message = scope.timedOut ? TIMEOUT_ERROR : STREAM_ENDED_ERROR;
-              controller.enqueue(ndjsonEvent({ type: "error", error: message }));
+              controller.enqueue(
+                ndjsonEvent({
+                  type: "error",
+                  error: message,
+                  code: scope.timedOut
+                    ? "request_timeout"
+                    : "generation_unavailable",
+                }),
+              );
               terminalEventSent = true;
             }
           } catch (error) {
@@ -624,7 +742,11 @@ export function createRequestHandler(
 
             const publicError = publicPipelineError(error, scope);
             controller.enqueue(
-              ndjsonEvent({ type: "error", error: publicError.message }),
+              ndjsonEvent({
+                type: "error",
+                error: publicError.message,
+                code: publicError.code,
+              }),
             );
             terminalEventSent = true;
           } finally {
@@ -660,8 +782,9 @@ export function createRequestHandler(
       streamOwnsResources = true;
       return new Response(stream, { status: 200, headers });
     } catch (error) {
-      return respond(
-        { error: DEFAULT_CHAT_ERROR_MESSAGE },
+      return respondError(
+        DEFAULT_CHAT_ERROR_MESSAGE,
+        "generation_unavailable",
         500,
         undefined,
         { errorClass: safeErrorClass(error) },

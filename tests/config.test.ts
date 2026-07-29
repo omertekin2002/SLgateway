@@ -42,8 +42,48 @@ describe("loadServiceConfig", () => {
       baseUrl: "https://primary.example.test/v1",
       apiKey: "primary-secret",
       model: "gpt-5.6-luna",
+      modelWasDefaulted: true,
     });
     expect(config.openRouter).toBeNull();
+  });
+
+  it("marks explicit primary models and accepts deployments without Gemini", () => {
+    const config = loadServiceConfig({
+      PRIMARY_LLM_BASE_URL: "https://primary.example.test/v1",
+      PRIMARY_LLM_API_KEY: "primary-secret",
+      PRIMARY_LLM_MODEL: "provider/supported-model",
+    });
+
+    expect(config.geminiApiKey).toBeNull();
+    expect(config.primaryLlm).toMatchObject({
+      model: "provider/supported-model",
+      modelWasDefaulted: false,
+    });
+  });
+
+  it("parses ordered OpenRouter models, removes duplicates, and rejects empty IDs", () => {
+    const config = loadServiceConfig({
+      ...minimumEnvironment,
+      OPENROUTER_FALLBACK_MODELS:
+        "vendor/first, openrouter/free, vendor/first",
+    });
+
+    expect(config.openRouter?.models).toEqual([
+      "vendor/first",
+      "openrouter/free",
+    ]);
+    expect(() =>
+      loadServiceConfig({
+        ...minimumEnvironment,
+        OPENROUTER_FALLBACK_MODELS: "vendor/first,,openrouter/free",
+      }),
+    ).toThrow(/empty model IDs/i);
+    expect(() =>
+      loadServiceConfig({
+        ...minimumEnvironment,
+        OPENROUTER_FALLBACK_MODELS: "one,two,three,four,five,six",
+      }),
+    ).toThrow(/at most 5/i);
   });
 
   it("requires at least one complete generation path", () => {

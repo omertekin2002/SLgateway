@@ -16,6 +16,8 @@ services:
         value: gemini-2.5-flash
       - key: OPENROUTER_BASE_URL
         value: https://openrouter.ai/api/v1
+      - key: OPENROUTER_FALLBACK_MODELS
+        value: openrouter/free
       - key: MAX_CONCURRENT_REQUESTS
         value: 4
       - key: REQUEST_TIMEOUT_MS

@@ -1,8 +1,9 @@
 import type OpenAI from "openai";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   OPENROUTER_MODELS,
+  GenerationUnavailableError,
   LlmResponseValidationError,
   createOpenAiCompatibleClient,
   extractResponseOutputText,
@@ -12,6 +13,10 @@ import {
   type OpenAiCompatibleClientOptions,
   type ProviderConfig,
 } from "../src/pipeline/llm-client";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 const providerConfig: ProviderConfig = {
   primary: {
@@ -28,6 +33,10 @@ const providerConfig: ProviderConfig = {
   appName: "SignLoop Chat Service",
   timeoutMs: 12_345,
 };
+
+async function unknownModelDiscovery() {
+  return "unknown" as const;
+}
 
 describe("createOpenAiCompatibleClient", () => {
   it("fails closed when the endpoint is absent", () => {
@@ -179,7 +188,7 @@ describe("runWithPrimaryAndOpenRouterFallback", () => {
         if (model !== "fallback/two") throw new Error("provider unavailable");
         return "Fallback answer";
       },
-      { createClient, logger },
+      { createClient, discoverModel: unknownModelDiscovery, logger },
     );
 
     expect(attempts).toEqual([
@@ -223,7 +232,7 @@ describe("runWithPrimaryAndOpenRouterFallback", () => {
           logger: { warn: vi.fn() },
         },
       ),
-    ).rejects.toThrow(/OpenRouter fallback failed/i);
+    ).rejects.toBeInstanceOf(GenerationUnavailableError);
 
     expect(attempts).toEqual(OPENROUTER_MODELS);
   });
@@ -255,6 +264,62 @@ describe("runWithPrimaryAndOpenRouterFallback", () => {
     });
   });
 
+  it("allows openrouter/free to succeed after primary failure", async () => {
+    const attempts: string[] = [];
+    const result = await runWithPrimaryAndOpenRouterFallback(
+      {
+        ...providerConfig,
+        openRouter: {
+          ...providerConfig.openRouter!,
+          models: ["openrouter/free"],
+        },
+      },
+      async (_client, model) => {
+        attempts.push(model);
+        if (model === "primary/model") throw new Error("primary unavailable");
+        return "router-selected answer";
+      },
+      {
+        createClient: (() => ({}) as OpenAI) as OpenAiCompatibleClientFactory,
+        discoverModel: unknownModelDiscovery,
+        logger: { warn: vi.fn() },
+      },
+    );
+
+    expect(attempts).toEqual(["primary/model", "openrouter/free"]);
+    expect(result).toMatchObject({
+      provider: "openrouter",
+      model: "openrouter/free",
+    });
+  });
+
+  it("stops the OpenRouter chain on non-eligible provider failures", async () => {
+    const attempts: string[] = [];
+    const unauthorized = Object.assign(new Error("unauthorized"), {
+      status: 401,
+      code: "invalid_api_key",
+    });
+
+    await expect(
+      runWithPrimaryAndOpenRouterFallback(
+        {
+          openRouter: providerConfig.openRouter,
+          publicServiceUrl: providerConfig.publicServiceUrl,
+          appName: providerConfig.appName,
+        },
+        async (_client, model) => {
+          attempts.push(model);
+          throw unauthorized;
+        },
+        {
+          createClient: (() => ({}) as OpenAI) as OpenAiCompatibleClientFactory,
+          logger: { warn: vi.fn() },
+        },
+      ),
+    ).rejects.toBeInstanceOf(GenerationUnavailableError);
+    expect(attempts).toEqual(["fallback/one"]);
+  });
+
   it("does not fallback for aborts or caller-rejected errors", async () => {
     const attempts: string[] = [];
     const createClient = (() => ({}) as OpenAI) as OpenAiCompatibleClientFactory;
@@ -267,7 +332,11 @@ describe("runWithPrimaryAndOpenRouterFallback", () => {
           attempts.push(model);
           throw abort;
         },
-        { createClient, logger: { warn: vi.fn() } },
+        {
+          createClient,
+          discoverModel: unknownModelDiscovery,
+          logger: { warn: vi.fn() },
+        },
       ),
     ).rejects.toBe(abort);
     expect(attempts).toEqual(["primary/model"]);
@@ -283,6 +352,7 @@ describe("runWithPrimaryAndOpenRouterFallback", () => {
         },
         {
           createClient,
+          discoverModel: unknownModelDiscovery,
           shouldFallback: (error) =>
             !(error instanceof LlmResponseValidationError),
           logger: { warn: vi.fn() },
@@ -301,7 +371,118 @@ describe("runWithPrimaryAndOpenRouterFallback", () => {
         },
         async () => "unreachable",
       ),
-    ).rejects.toThrow(/no LLM generation provider is configured/i);
+    ).rejects.toBeInstanceOf(GenerationUnavailableError);
+  });
+
+  it("skips primary when discovery definitely excludes the configured model", async () => {
+    const attempts: string[] = [];
+    const result = await runWithPrimaryAndOpenRouterFallback(
+      providerConfig,
+      async (_client, model) => {
+        attempts.push(model);
+        return `answer from ${model}`;
+      },
+      {
+        createClient: (() => ({}) as OpenAI) as OpenAiCompatibleClientFactory,
+        discoverModel: vi.fn().mockResolvedValue("unavailable"),
+        logger: { warn: vi.fn() },
+      },
+    );
+
+    expect(attempts).toEqual(["fallback/one"]);
+    expect(result).toMatchObject({ provider: "openrouter", model: "fallback/one" });
+  });
+
+  it("tries primary normally when discovery is unknown", async () => {
+    const attempts: string[] = [];
+    await runWithPrimaryAndOpenRouterFallback(
+      providerConfig,
+      async (_client, model) => {
+        attempts.push(model);
+        return "primary answer";
+      },
+      {
+        createClient: (() => ({}) as OpenAI) as OpenAiCompatibleClientFactory,
+        discoverModel: vi.fn().mockResolvedValue("unknown"),
+        logger: { warn: vi.fn() },
+      },
+    );
+
+    expect(attempts).toEqual(["primary/model"]);
+  });
+
+  it("logs only allowlisted provider failure metadata", async () => {
+    const logger = { warn: vi.fn() };
+    const providerError = Object.assign(
+      new Error(
+        "private prompt primary-key https://primary.test/v1 upstream body",
+      ),
+      {
+        name: "NotFoundError",
+        status: 404,
+        code: "model_not_found",
+        requestID: "req_safe123",
+        responseBody: "private provider body",
+      },
+    );
+
+    await runWithPrimaryAndOpenRouterFallback(
+      providerConfig,
+      async (_client, model) => {
+        if (model === "primary/model") throw providerError;
+        return "fallback answer";
+      },
+      {
+        createClient: (() => ({}) as OpenAI) as OpenAiCompatibleClientFactory,
+        discoverModel: unknownModelDiscovery,
+        logger,
+      },
+    );
+
+    expect(logger.warn.mock.calls[0]?.[1]).toEqual({
+      event: "provider_failure",
+      provider: "primary-openai-compatible",
+      model: "primary/model",
+      errorClass: "NotFoundError",
+      statusCode: 404,
+      providerCode: "model_not_found",
+      upstreamRequestId: "req_safe123",
+    });
+    const logged = JSON.stringify(logger.warn.mock.calls);
+    expect(logged).not.toContain("private prompt");
+    expect(logged).not.toContain("primary-key");
+    expect(logged).not.toContain("https://primary.test/v1");
+    expect(logged).not.toContain("private provider body");
+  });
+
+  it("uses one abort signal and deadline across the provider chain", async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    const result = runWithPrimaryAndOpenRouterFallback(
+      { ...providerConfig, timeoutMs: 25 },
+      async (_client, model, signal) => {
+        signals.push(signal);
+        if (model === "primary/model") throw new Error("primary unavailable");
+        return new Promise<string>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+        });
+      },
+      {
+        createClient: (() => ({}) as OpenAI) as OpenAiCompatibleClientFactory,
+        discoverModel: unknownModelDiscovery,
+        logger: { warn: vi.fn() },
+      },
+    );
+    const rejection = expect(result).rejects.toMatchObject({
+      name: "TimeoutError",
+    });
+
+    await vi.advanceTimersByTimeAsync(25);
+    await rejection;
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).toBe(signals[1]);
   });
 });
 

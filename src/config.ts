@@ -1,13 +1,14 @@
 export const OPENROUTER_FALLBACK_MODELS = Object.freeze([
-  "google/gemma-4-31b-it:free",
-  "openai/gpt-oss-120b:free",
   "openrouter/free",
 ] as const);
+
+export const MAX_OPENROUTER_FALLBACK_MODELS = 5;
 
 export type PrimaryLlmConfig = Readonly<{
   baseUrl: string;
   apiKey: string;
   model: string;
+  modelWasDefaulted: boolean;
 }>;
 
 export type OpenRouterConfig = Readonly<{
@@ -17,7 +18,7 @@ export type OpenRouterConfig = Readonly<{
 }>;
 
 export type ServiceConfig = Readonly<{
-  geminiApiKey: string;
+  geminiApiKey: string | null;
   geminiSearchModel: string;
   primaryLlm: PrimaryLlmConfig | null;
   openRouter: OpenRouterConfig | null;
@@ -34,14 +35,6 @@ type Environment = Readonly<Record<string, string | undefined>>;
 function optionalValue(environment: Environment, name: string): string | null {
   const value = environment[name]?.trim();
   return value ? value : null;
-}
-
-function requiredValue(environment: Environment, name: string): string {
-  const value = optionalValue(environment, name);
-  if (!value) {
-    throw new Error(`${name} is required`);
-  }
-  return value;
 }
 
 function credentialValue(name: string, value: string): string {
@@ -97,6 +90,34 @@ function parseGeminiSearchModel(value: string): string {
   return normalized;
 }
 
+function parseProviderModel(name: string, value: string): string {
+  const model = value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/u.test(model)) {
+    throw new Error(`${name} contains an invalid model ID`);
+  }
+  return model;
+}
+
+function parseOpenRouterModels(environment: Environment): readonly string[] {
+  const configured = environment.OPENROUTER_FALLBACK_MODELS;
+  if (configured === undefined) return OPENROUTER_FALLBACK_MODELS;
+
+  const entries = configured.split(",").map((model) => model.trim());
+  if (!entries.length || entries.some((model) => !model)) {
+    throw new Error("OPENROUTER_FALLBACK_MODELS must not contain empty model IDs");
+  }
+
+  const models = [...new Set(entries)].map((model) =>
+    parseProviderModel("OPENROUTER_FALLBACK_MODELS", model),
+  );
+  if (models.length > MAX_OPENROUTER_FALLBACK_MODELS) {
+    throw new Error(
+      `OPENROUTER_FALLBACK_MODELS supports at most ${MAX_OPENROUTER_FALLBACK_MODELS} models`,
+    );
+  }
+  return Object.freeze(models);
+}
+
 function parseCorsOrigins(raw: string | null): ReadonlySet<string> {
   if (!raw) return new Set<string>();
 
@@ -134,17 +155,20 @@ function parseCorsOrigins(raw: string | null): ReadonlySet<string> {
 export function loadServiceConfig(
   environment: Environment = process.env,
 ): ServiceConfig {
-  const geminiApiKey = credentialValue(
-    "GEMINI_API_KEY",
-    requiredValue(environment, "GEMINI_API_KEY"),
-  );
+  const rawGeminiApiKey = optionalValue(environment, "GEMINI_API_KEY");
+  const geminiApiKey = rawGeminiApiKey
+    ? credentialValue("GEMINI_API_KEY", rawGeminiApiKey)
+    : null;
   const primaryBaseUrl = optionalValue(environment, "PRIMARY_LLM_BASE_URL");
   const rawPrimaryApiKey = optionalValue(environment, "PRIMARY_LLM_API_KEY");
   const primaryApiKey = rawPrimaryApiKey
     ? credentialValue("PRIMARY_LLM_API_KEY", rawPrimaryApiKey)
     : null;
-  const primaryModel =
-    optionalValue(environment, "PRIMARY_LLM_MODEL") ?? "gpt-5.6-luna";
+  const configuredPrimaryModel = optionalValue(environment, "PRIMARY_LLM_MODEL");
+  const primaryModel = parseProviderModel(
+    "PRIMARY_LLM_MODEL",
+    configuredPrimaryModel ?? "gpt-5.6-luna",
+  );
 
   if ((primaryBaseUrl && !primaryApiKey) || (!primaryBaseUrl && primaryApiKey)) {
     throw new Error(
@@ -158,6 +182,7 @@ export function loadServiceConfig(
           baseUrl: parseHttpUrl("PRIMARY_LLM_BASE_URL", primaryBaseUrl),
           apiKey: primaryApiKey,
           model: primaryModel,
+          modelWasDefaulted: configuredPrimaryModel === null,
         })
       : null;
 
@@ -172,7 +197,7 @@ export function loadServiceConfig(
     ? Object.freeze({
         baseUrl: parseHttpUrl("OPENROUTER_BASE_URL", openRouterBaseUrl),
         apiKey: openRouterApiKey,
-        models: OPENROUTER_FALLBACK_MODELS,
+        models: parseOpenRouterModels(environment),
       })
     : null;
 
