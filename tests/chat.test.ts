@@ -1,6 +1,11 @@
 // Ported from SignLoop at 3f830abaae4d47dedecabea3fca57a4899a8f688.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MockLanguageModelV4 } from "ai/test";
+import {
+  FIRST_CHUNK_TIMEOUT_MS,
+  GEMINI_FIRST_CHUNK_TIMEOUT_MS,
+  openingDeadlineMs,
+} from "../src/pipeline/agent-provider";
 import { simulateReadableStream } from "ai";
 
 const mocks = vi.hoisted(() => ({
@@ -855,7 +860,7 @@ it.each([
   },
 );
 
-it("tries Gemini first with low thinking, then the primary, then OpenRouter", async () => {
+it("tries Gemini first with high thinking, then the primary, then OpenRouter", async () => {
   const calls: string[] = [];
   const failing = (name: string) =>
     new MockLanguageModelV4({
@@ -887,8 +892,61 @@ it("tries Gemini first with low thinking, then the primary, then OpenRouter", as
   expect(reply).toMatchObject({ provider: "openrouter", model: "fallback" });
   expect(gemini.doStreamCalls[0]?.providerOptions).toEqual({
     openai: { store: false },
-    google: { thinkingConfig: { thinkingLevel: "low" } },
+    google: { thinkingConfig: { thinkingLevel: "high" } },
   });
+});
+
+it("waits longer for Gemini to start answering than for other providers", async () => {
+  vi.useFakeTimers();
+  try {
+    const slowStart = (name: string) =>
+      new MockLanguageModelV4({
+        doStream: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 30_000));
+          return streamStep(0) as StepResult;
+        },
+      });
+    const gemini = slowStart("gemini");
+    mocks.gemini.mockReturnValue(gemini);
+    const fallback = scriptedModel();
+    mocks.responses.mockReturnValue(fallback);
+
+    // No override: each provider gets its own default opening deadline.
+    const run = generateReply(messages, {
+      ...baseOptions,
+      providerConfig: {
+        ...baseOptions.providerConfig,
+        primary: undefined,
+        gemini: { apiKey: "gemini-key", model: "gemini-3.8-flash" },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    await expect(run).resolves.toMatchObject({ provider: "gemini" });
+    expect(fallback.doStreamCalls).toHaveLength(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("still abandons a silent non-Gemini provider after the default deadline", async () => {
+  vi.useFakeTimers();
+  try {
+    const silent = new MockLanguageModelV4({
+      doStream: () => new Promise(() => {}),
+    });
+    const fallback = scriptedModel();
+    mocks.responses.mockImplementation((model: string) =>
+      model === "primary" ? silent : fallback,
+    );
+
+    const run = generateReply(messages, baseOptions);
+    await vi.advanceTimersByTimeAsync(FIRST_CHUNK_TIMEOUT_MS);
+
+    await expect(run).resolves.toMatchObject({ provider: "openrouter" });
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 it("reports Gemini as the provider when it answers", async () => {
@@ -988,4 +1046,13 @@ it("does not log raw SDK stream errors", async () => {
     /private upstream/,
   );
   expect(errorLog).not.toHaveBeenCalled();
+});
+
+it("uses one explicit opening deadline for every provider when overridden", () => {
+  expect(openingDeadlineMs("gemini")).toBe(GEMINI_FIRST_CHUNK_TIMEOUT_MS);
+  expect(openingDeadlineMs("openrouter")).toBe(FIRST_CHUNK_TIMEOUT_MS);
+  expect(openingDeadlineMs("primary-openai-compatible")).toBe(
+    FIRST_CHUNK_TIMEOUT_MS,
+  );
+  expect(openingDeadlineMs("gemini", 20)).toBe(20);
 });

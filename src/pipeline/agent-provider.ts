@@ -15,6 +15,22 @@ import {
   type SafeProviderFailure,
 } from "./llm-client";
 export const FIRST_CHUNK_TIMEOUT_MS = 20_000;
+// Gemini streams nothing while it thinks, and high thinking can run well past the default opening
+// deadline. Its first-party API rarely accepts a request and then goes silent, so it waits longer.
+export const GEMINI_FIRST_CHUNK_TIMEOUT_MS = 90_000;
+
+/** How long a provider may take to start answering a step before the next provider is tried. */
+export function openingDeadlineMs(
+  provider: LlmProvider,
+  override?: number,
+): number {
+  return (
+    override ??
+    (provider === "gemini"
+      ? GEMINI_FIRST_CHUNK_TIMEOUT_MS
+      : FIRST_CHUNK_TIMEOUT_MS)
+  );
+}
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
 type RoutedCandidate = ReturnType<ReturnType<typeof createOpenAI>["responses"]>;
@@ -150,8 +166,7 @@ export function createRoutedModel(
     fetch?: FetchImplementation;
   } = {},
 ) {
-  const firstChunkTimeoutMs =
-    options.firstChunkTimeoutMs ?? FIRST_CHUNK_TIMEOUT_MS;
+  const firstChunkTimeoutOverride = options.firstChunkTimeoutMs;
   const fetchImplementation = options.fetch ?? globalThis.fetch;
   const openAiCompatible = (url: string, key: string, model: string) =>
     createOpenAI({
@@ -206,12 +221,12 @@ export function createRoutedModel(
   const base = candidates[0]!.languageModel;
   async function attempt<T>(
     signal: AbortSignal | undefined,
-    run: (candidate: RoutedCandidate) => PromiseLike<T>,
+    run: (candidate: (typeof candidates)[number]) => PromiseLike<T>,
   ): Promise<T> {
     for (;;) {
       signal?.throwIfAborted();
       try {
-        return await run(candidates[index]!.languageModel);
+        return await run(candidates[index]!);
       } catch (error) {
         if (signal?.aborted) throw error;
         const candidate = candidates[index]!;
@@ -248,11 +263,15 @@ export function createRoutedModel(
       supportedUrls: base.supportedUrls,
       doGenerate: (options: Parameters<RoutedCandidate["doGenerate"]>[0]) =>
         attempt(options.abortSignal, (candidate) =>
-          candidate.doGenerate(options),
+          candidate.languageModel.doGenerate(options),
         ),
       doStream: (options: StreamOptions) =>
         attempt(options.abortSignal, (candidate) =>
-          openStreamWithDeadline(candidate, options, firstChunkTimeoutMs),
+          openStreamWithDeadline(
+            candidate.languageModel,
+            options,
+            openingDeadlineMs(candidate.provider, firstChunkTimeoutOverride),
+          ),
         ),
     },
   };

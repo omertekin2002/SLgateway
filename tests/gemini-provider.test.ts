@@ -56,7 +56,7 @@ beforeEach(() => {
   });
 });
 
-it("calls Gemini natively with its key, low thinking, and tool continuation", async () => {
+it("calls Gemini natively with its key, high thinking, and tool continuation", async () => {
   const fetchMock = vi
     .fn()
     .mockResolvedValueOnce(searchCall())
@@ -80,9 +80,10 @@ it("calls Gemini natively with its key, low thinking, and tool continuation", as
 
   const first = body(fetchMock, 0);
   expect(first.generationConfig).toMatchObject({
-    maxOutputTokens: 4096,
-    thinkingConfig: { thinkingLevel: "low" },
+    thinkingConfig: { thinkingLevel: "high" },
   });
+  // No service cap: Gemini's own output limit applies, leaving room for high thinking.
+  expect(first.generationConfig).not.toHaveProperty("maxOutputTokens");
   expect(first.tools[0].functionDeclarations).toEqual(
     expect.arrayContaining([expect.objectContaining({ name: "search_web" })]),
   );

@@ -339,13 +339,13 @@ export async function* generateChatReplyStream(
       )}\n\n${buildAuthoritativeUtcTimeContext(options.dependencies?.now?.())}\n\n${buildToolInstructions(toolNotes)}${researchMode === "always" ? "\nFresh research is required. Fetch relevant source text with read_url or http_get during this turn before answering; search snippets and earlier sources are not sufficient." : ""}`,
     tools,
     stopWhen: isStepCount(MAX_STEPS),
-    maxOutputTokens: options?.maxOutputTokens ?? 4096,
+    // No service cap: each provider's own output limit applies, which leaves room for thinking.
+    maxOutputTokens: options?.maxOutputTokens,
     maxRetries: 0,
     providerOptions: {
       openai: { store: false },
-      // Gemini 3 counts thinking toward maxOutputTokens and streams nothing while it thinks. Low
-      // keeps a step's thinking inside the output budget and the first-content deadline.
-      google: { thinkingConfig: { thinkingLevel: "low" } },
+      // Gemini streams nothing while it thinks; agent-provider gives it a longer opening deadline.
+      google: { thinkingConfig: { thinkingLevel: "high" } },
     },
     prepareStep: ({ stepNumber }) => {
       if (stepNumber >= MAX_STEPS - 1) return { toolChoice: "none" as const };
