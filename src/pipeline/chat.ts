@@ -11,6 +11,7 @@ import type { WebToolsConfig } from "../config";
 import type {
   ProviderConfig,
   LlmFallbackLogger,
+  LlmProvider,
   FetchImplementation,
 } from "./llm-client";
 import { createRoutedModel } from "./agent-provider";
@@ -115,7 +116,7 @@ export function describeToolInput(tool: ChatToolName, input: unknown): string {
 }
 export type ChatReply = {
   message: string;
-  provider: "primary-openai-compatible" | "openrouter";
+  provider: LlmProvider;
   model: string;
   webSearch: WebSearchMetadata | null;
   agentMessages?: ModelMessage[];
@@ -340,7 +341,12 @@ export async function* generateChatReplyStream(
     stopWhen: isStepCount(MAX_STEPS),
     maxOutputTokens: options?.maxOutputTokens ?? 4096,
     maxRetries: 0,
-    providerOptions: { openai: { store: false } },
+    providerOptions: {
+      openai: { store: false },
+      // Gemini 3 counts thinking toward maxOutputTokens and streams nothing while it thinks. Low
+      // keeps a step's thinking inside the output budget and the first-content deadline.
+      google: { thinkingConfig: { thinkingLevel: "low" } },
+    },
     prepareStep: ({ stepNumber }) => {
       if (stepNumber >= MAX_STEPS - 1) return { toolChoice: "none" as const };
       if (researchMode === "always" && !evidence.some((text) => text.trim())) {

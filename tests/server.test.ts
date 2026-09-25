@@ -28,6 +28,10 @@ function makeConfig(overrides: Partial<ServiceConfig> = {}): ServiceConfig {
       geminiApiKey: "gemini-secret-never-return",
       geminiModel: "gemini-test-model",
     },
+    geminiChat: {
+      apiKey: "gemini-secret-never-return",
+      model: "gemini-test-model",
+    },
     imageGenerationEnabled: false,
     imageGenerationModel: "gpt-image-2",
     publicServiceUrl: TEST_URL,

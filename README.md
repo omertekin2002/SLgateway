@@ -10,7 +10,7 @@ The engine is ported from SignLoop commit `3f830abaae4d47dedecabea3fca57a4899a8f
 client sends text + optional tool history/source catalog
   -> Bun.serve HTTP boundary
   -> per-process concurrency gate + bounded request validation
-  -> authoritative UTC time + server-controlled provider selection
+  -> authoritative UTC time + server-controlled provider order (Gemini, optional primary, OpenRouter)
   -> SignLoop ToolLoopAgent (at most 10 model steps)
        -> search_web: Brave / Firecrawl / Gemini search leads
        -> read_url: Firecrawl / Jina page or PDF text
@@ -37,7 +37,7 @@ bun run test
 bun run dev
 ```
 
-Configure a complete primary provider URL/key pair, an OpenRouter key, or both. Provider endpoints must support **streaming Responses API function calls and tool-result continuation**. This is also required for non-streaming HTTP clients: the service collects the same internal streaming agent loop into a JSON reply.
+Configure `GEMINI_API_KEY`, a complete primary provider URL/key pair, an OpenRouter key, or any combination. Each model step tries them in that order. Gemini is called through its native API. OpenAI-compatible endpoints (primary and OpenRouter) must support **streaming Responses API function calls and tool-result continuation**. This is also required for non-streaming HTTP clients: the service collects the same internal streaming agent loop into a JSON reply.
 
 Use `bun run start` in production. The listener binds to `0.0.0.0:10000` by default. `/healthz` checks process liveness without calling providers.
 
@@ -47,16 +47,17 @@ Configuration is validated once at startup. Provider URLs, credentials, models, 
 
 | Variable                     | Default                                               | Purpose                                                                                                                                                                         |
 | ---------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PRIMARY_LLM_BASE_URL`       | unset                                                 | Primary OpenAI-compatible API base URL, including `/v1` where applicable. Set together with its key.                                                                            |
-| `PRIMARY_LLM_API_KEY`        | unset                                                 | Primary credential.                                                                                                                                                             |
+| `PRIMARY_LLM_BASE_URL`       | unset                                                 | Optional OpenAI-compatible API base URL, including `/v1` where applicable, tried after Gemini. Set together with its key.                                                       |
+| `PRIMARY_LLM_API_KEY`        | unset                                                 | Optional primary credential.                                                                                                                                                    |
 | `PRIMARY_LLM_MODEL`          | `gpt-5.6-luna`                                        | Existing gateway default retained for compatibility. Set an explicit model advertised by your endpoint that supports Responses tools. Default use emits a safe startup warning. |
-| `OPENROUTER_API_KEY`         | unset                                                 | Enables OpenRouter generation and fallback. Required if primary is absent.                                                                                                      |
+| `OPENROUTER_API_KEY`         | unset                                                 | Enables the OpenRouter fallback, tried after Gemini and primary.                                                                                                                |
 | `OPENROUTER_BASE_URL`        | `https://openrouter.ai/api/v1`                        | OpenRouter-compatible endpoint.                                                                                                                                                 |
 | `OPENROUTER_FALLBACK_MODELS` | `openrouter/free`                                     | Ordered comma-separated model IDs, deduplicated, maximum five.                                                                                                                  |
 | `WEB_SEARCH_PROVIDER`        | automatic                                             | Optional `brave`, `firecrawl`, or `gemini`. Without an override, configured keys are preferred in that order.                                                                   |
 | `BRAVE_SEARCH_API_KEY`       | unset                                                 | Enables Brave search.                                                                                                                                                           |
 | `FIRECRAWL_API_KEY`          | unset                                                 | Enables Firecrawl search and page/PDF reading.                                                                                                                                  |
-| `GEMINI_API_KEY`             | unset                                                 | Enables Google-grounded Gemini search.                                                                                                                                          |
+| `GEMINI_API_KEY`             | unset                                                 | Enables Gemini chat generation, tried first, and Google-grounded Gemini search.                                                                                                 |
+| `GEMINI_CHAT_MODEL`          | `gemini-3.8-flash`                                    | Gemini answering model. Runs with low thinking so thinking stays inside the per-step output budget.                                                                             |
 | `GEMINI_SEARCH_MODEL`        | `gemini-2.5-flash`                                    | Independent of the answering model.                                                                                                                                             |
 | `JINA_API_KEY`               | unset                                                 | Optional credential for Jina Reader. The reader is also used without a key.                                                                                                     |
 | `ENABLE_IMAGE_GENERATION`    | `false`                                               | Opt-in image tool. Requires primary configuration and positive model discovery.                                                                                                 |
@@ -109,8 +110,8 @@ The strict check establishes that fresh evidence was retrieved. It does not esta
 ```json
 {
   "message": "Answer [1]\n\nSources:\n- [1] [Source title](<https://example.com/page>)",
-  "provider": "primary-openai-compatible",
-  "model": "configured-model",
+  "provider": "gemini",
+  "model": "gemini-3.8-flash",
   "webSearch": {
     "query": "model-selected query",
     "attemptedQueries": ["model-selected query"],
@@ -136,7 +137,7 @@ The strict check establishes that fresh evidence was retrieved. It does not esta
 }
 ```
 
-`provider` is `primary-openai-compatible` or `openrouter`. It identifies the last selected text provider; different completed steps can use different providers after fallback. `agentMessages`, when present, contains the SDK assistant/tool exchanges for future turns. These are bounded and can be omitted when there is no useful tool replay.
+`provider` is `gemini`, `primary-openai-compatible`, or `openrouter`. It identifies the last selected text provider; different completed steps can use different providers after fallback. `agentMessages`, when present, contains the SDK assistant/tool exchanges for future turns. These are bounded and can be omitted when there is no useful tool replay.
 
 `webSources` is a cumulative source catalog with stable one-based indices. `readSources` identifies sources fetched during the current turn. The footer lists fetched sources and valid references to earlier sources, preserving their original numbers. Search leads do not enter the catalog until fetched. A direct page/API read can produce sources with no search query. If no catalog exists, `webSearch`/`webSearchQuery` are null and legacy search arrays/counts are empty/zero; `toolActivity` still records searches that produced only unread leads.
 
@@ -168,7 +169,7 @@ The content type is `application/x-ndjson; charset=utf-8`. Each line is one JSON
 {"type":"tool","activity":{"id":"call-1","tool":"read_url","query":"https://example.com/page","status":"running"}}
 {"type":"tool","activity":{"id":"call-1","tool":"read_url","query":"https://example.com/page","status":"complete"}}
 {"type":"delta","text":"Answer [1]"}
-{"type":"done","message":"Answer [1]\n\nSources:\n- [1] [Source](<https://example.com/page>)","provider":"primary-openai-compatible","model":"configured-model"}
+{"type":"done","message":"Answer [1]\n\nSources:\n- [1] [Source](<https://example.com/page>)","provider":"gemini","model":"gemini-3.8-flash"}
 ```
 
 The `done` event carries the same metadata as the JSON response. Tool statuses are `running`, `complete`, or `error`. Clients should tolerate new event types. Treat **`done.message` as the canonical answer**: citation normalization, source footers, and figure notices happen after generation. A connected stream ends with one `done` or `error` event. Disconnects cancel provider/tool work.
@@ -184,6 +185,8 @@ Errors after the stream opens retain HTTP 200 and appear as a terminal event:
 ```
 
 ### Provider fallback and limits
+
+Each model step tries Gemini (`GEMINI_API_KEY`), then the optional primary, then each OpenRouter model in order. The startup log line `generation_providers` lists the configured order. Gemini and primary failures always move to the next provider; OpenRouter stops early on request or credential errors (400, 401, 403, 405, 413, 422). Once a request moves on, its later steps stay on the provider that answered.
 
 Primary model discovery remains advisory for text generation: a valid model list that excludes the configured model skips primary; unknown availability still attempts it. Definite results are cached for five minutes; unknown results for one minute, so a slow or unsupported `/models` endpoint does not delay every request. Text and image model checks run concurrently. All discovery and generation share the request deadline.
 
@@ -228,7 +231,7 @@ The concurrency gate applies per process. CORS is browser interoperability, not 
 
 ## Deployment and validation
 
-[render.yaml](./render.yaml) installs the locked dependencies, type-checks, runs tests, starts Bun, and checks `/healthz`. No database or persistent disk is needed. Add integration credentials through Render environment settings. Set `PRIMARY_LLM_MODEL` to a compatible model supported by your endpoint. Existing deployments explicitly configured with `REQUEST_TIMEOUT_MS=180000` retain that shorter deadline until updated.
+[render.yaml](./render.yaml) installs the locked dependencies, type-checks, runs tests, starts Bun, and checks `/healthz`. No database or persistent disk is needed. Add integration credentials through Render environment settings. `GEMINI_API_KEY` alone is a complete generation path. If you configure the optional primary, set `PRIMARY_LLM_MODEL` to a compatible model supported by your endpoint. Existing deployments explicitly configured with `REQUEST_TIMEOUT_MS=180000` retain that shorter deadline until updated.
 
 ```sh
 curl --fail http://localhost:10000/healthz

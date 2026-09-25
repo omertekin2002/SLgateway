@@ -184,8 +184,16 @@ function waitWithAbort<T>(
   });
 }
 
-function toProviderConfig(config: ServiceConfig): ProviderConfig {
+export function toProviderConfig(config: ServiceConfig): ProviderConfig {
   return {
+    ...(config.geminiChat
+      ? {
+          gemini: {
+            apiKey: config.geminiChat.apiKey,
+            model: config.geminiChat.model,
+          },
+        }
+      : {}),
     ...(config.primaryLlm
       ? {
           primary: {

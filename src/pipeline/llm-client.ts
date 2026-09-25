@@ -6,7 +6,13 @@ import OpenAI from "openai";
 
 export const OPENROUTER_MODELS = ["openrouter/free"] as const;
 
-export type LlmProvider = "primary-openai-compatible" | "openrouter";
+export type LlmProvider = "gemini" | "primary-openai-compatible" | "openrouter";
+
+/** Native Gemini API generation; tried before every other provider. */
+export type GeminiProviderConfig = {
+  readonly apiKey: string;
+  readonly model: string;
+};
 
 export type PrimaryProviderConfig = {
   readonly baseURL: string;
@@ -26,6 +32,7 @@ export type OpenRouterProviderConfig = {
  * and unit tests can supply isolated provider settings.
  */
 export type ProviderConfig = {
+  readonly gemini?: GeminiProviderConfig;
   readonly primary?: PrimaryProviderConfig;
   readonly openRouter?: OpenRouterProviderConfig;
   readonly publicServiceUrl: string;

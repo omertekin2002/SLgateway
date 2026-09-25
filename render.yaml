@@ -12,6 +12,8 @@ services:
         value: production
       - key: APP_NAME
         value: SignLoop Chat Service
+      - key: GEMINI_CHAT_MODEL
+        value: gemini-3.8-flash
       - key: GEMINI_SEARCH_MODEL
         value: gemini-2.5-flash
       - key: OPENROUTER_BASE_URL
@@ -27,12 +29,6 @@ services:
       - key: IMAGE_GENERATION_MODEL
         value: gpt-image-2
       - key: GEMINI_API_KEY
-        sync: false
-      - key: PRIMARY_LLM_BASE_URL
-        sync: false
-      - key: PRIMARY_LLM_API_KEY
-        sync: false
-      - key: PRIMARY_LLM_MODEL
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false

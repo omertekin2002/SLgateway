@@ -83,11 +83,9 @@ describe("loadServiceConfig", () => {
   });
 
   it("requires at least one complete generation path", () => {
-    expect(() =>
-      loadServiceConfig({
-        GEMINI_API_KEY: "gemini-secret",
-      }),
-    ).toThrow(/generation|provider|OPENROUTER/i);
+    expect(() => loadServiceConfig({})).toThrow(
+      /GEMINI_API_KEY.*OPENROUTER_API_KEY/i,
+    );
 
     expect(() =>
       loadServiceConfig({
@@ -95,6 +93,32 @@ describe("loadServiceConfig", () => {
         PRIMARY_LLM_BASE_URL: "https://primary.example.test/v1",
       }),
     ).toThrow(/configured together/i);
+  });
+
+  it("uses the Gemini key for chat generation on its own", () => {
+    const config = loadServiceConfig({ GEMINI_API_KEY: "gemini-secret" });
+
+    expect(config.geminiChat).toEqual({
+      apiKey: "gemini-secret",
+      model: "gemini-3.8-flash",
+    });
+    expect(config.primaryLlm).toBeNull();
+    expect(config.openRouter).toBeNull();
+    expect(
+      loadServiceConfig({
+        GEMINI_API_KEY: "gemini-secret",
+        GEMINI_CHAT_MODEL: "models/gemini-3.7-flash",
+      }).geminiChat?.model,
+    ).toBe("gemini-3.7-flash");
+    expect(() =>
+      loadServiceConfig({
+        GEMINI_API_KEY: "gemini-secret",
+        GEMINI_CHAT_MODEL: "gemini flash",
+      }),
+    ).toThrow(/GEMINI_CHAT_MODEL is invalid/);
+    expect(
+      loadServiceConfig({ OPENROUTER_API_KEY: "openrouter-secret" }).geminiChat,
+    ).toBeNull();
   });
 
   it("accepts only explicit HTTP CORS origins", () => {

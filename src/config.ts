@@ -13,6 +13,11 @@ export type WebToolsConfig = Readonly<{
   geminiModel?: string;
 }>;
 
+export type GeminiChatConfig = Readonly<{
+  apiKey: string;
+  model: string;
+}>;
+
 export type PrimaryLlmConfig = Readonly<{
   baseUrl: string;
   apiKey: string;
@@ -28,6 +33,7 @@ export type OpenRouterConfig = Readonly<{
 
 export type ServiceConfig = Readonly<{
   webTools: WebToolsConfig;
+  geminiChat: GeminiChatConfig | null;
   imageGenerationEnabled: boolean;
   imageGenerationModel: string;
   primaryLlm: PrimaryLlmConfig | null;
@@ -94,10 +100,10 @@ function parseHttpUrl(name: string, value: string): string {
   return value.replace(/\/+$/, "");
 }
 
-function parseGeminiSearchModel(value: string): string {
+function parseGeminiModel(name: string, value: string): string {
   const normalized = value.replace(/^models\//, "");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(normalized)) {
-    throw new Error("GEMINI_SEARCH_MODEL is invalid");
+    throw new Error(`${name} is invalid`);
   }
   return normalized;
 }
@@ -223,9 +229,20 @@ export function loadServiceConfig(
       })
     : null;
 
-  if (!primaryLlm && !openRouter) {
+  // The Gemini key serves both grounded search and, first in the chain, chat generation.
+  const geminiChat = geminiApiKey
+    ? Object.freeze({
+        apiKey: geminiApiKey,
+        model: parseGeminiModel(
+          "GEMINI_CHAT_MODEL",
+          optionalValue(environment, "GEMINI_CHAT_MODEL") ?? "gemini-3.8-flash",
+        ),
+      })
+    : null;
+
+  if (!geminiChat && !primaryLlm && !openRouter) {
     throw new Error(
-      "Configure a primary LLM provider, OPENROUTER_API_KEY, or both",
+      "Configure GEMINI_API_KEY, a primary LLM provider, or OPENROUTER_API_KEY",
     );
   }
 
@@ -252,7 +269,8 @@ export function loadServiceConfig(
     const value = optionalValue(environment, name);
     return value ? credentialValue(name, value) : null;
   };
-  const geminiSearchModel = parseGeminiSearchModel(
+  const geminiSearchModel = parseGeminiModel(
+    "GEMINI_SEARCH_MODEL",
     optionalValue(environment, "GEMINI_SEARCH_MODEL") ?? "gemini-2.5-flash",
   );
   const publicServiceUrl = parseHttpUrl(
@@ -271,6 +289,7 @@ export function loadServiceConfig(
       geminiApiKey,
       geminiModel: geminiSearchModel,
     }),
+    geminiChat,
     imageGenerationEnabled: imageEnabled === "true",
     imageGenerationModel: parseProviderModel(
       "IMAGE_GENERATION_MODEL",

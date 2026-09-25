@@ -6,11 +6,15 @@ import { simulateReadableStream } from "ai";
 const mocks = vi.hoisted(() => ({
   search: vi.fn(),
   responses: vi.fn(),
+  gemini: vi.fn(),
   readUrl: vi.fn(),
   generateImage: vi.fn(),
 }));
 vi.mock("@ai-sdk/openai", () => ({
   createOpenAI: () => ({ responses: mocks.responses }),
+}));
+vi.mock("@ai-sdk/google", () => ({
+  createGoogleGenerativeAI: () => ({ languageModel: mocks.gemini }),
 }));
 vi.mock("../src/pipeline/web-search", () => ({ searchWeb: mocks.search }));
 vi.mock("../src/pipeline/url-reader", () => ({ readUrl: mocks.readUrl }));
@@ -850,6 +854,59 @@ it.each([
     expect(next.doStreamCalls).toHaveLength(continues ? 1 : 0);
   },
 );
+
+it("tries Gemini first with low thinking, then the primary, then OpenRouter", async () => {
+  const calls: string[] = [];
+  const failing = (name: string) =>
+    new MockLanguageModelV4({
+      doStream: async () => {
+        calls.push(name);
+        // A request-shaped Gemini error must not stop the chain: only OpenRouter errors are
+        // screened by the fallback-eligibility policy.
+        throw Object.assign(new Error(`${name} failed`), { status: 400 });
+      },
+    });
+  const gemini = failing("gemini");
+  const primary = failing("primary");
+  const fallback = scriptedModel();
+  mocks.gemini.mockReturnValue(gemini);
+  mocks.responses.mockImplementation((model: string) =>
+    model === "primary" ? primary : fallback,
+  );
+
+  const reply = await generateReply(messages, {
+    ...baseOptions,
+    providerConfig: {
+      ...baseOptions.providerConfig,
+      gemini: { apiKey: "gemini-key", model: "gemini-3.8-flash" },
+    },
+  });
+
+  expect(mocks.gemini).toHaveBeenCalledWith("gemini-3.8-flash");
+  expect(calls).toEqual(["gemini", "primary"]);
+  expect(reply).toMatchObject({ provider: "openrouter", model: "fallback" });
+  expect(gemini.doStreamCalls[0]?.providerOptions).toEqual({
+    openai: { store: false },
+    google: { thinkingConfig: { thinkingLevel: "low" } },
+  });
+});
+
+it("reports Gemini as the provider when it answers", async () => {
+  mocks.gemini.mockReturnValue(scriptedModel());
+  const other = scriptedModel();
+  mocks.responses.mockReturnValue(other);
+
+  const reply = await generateReply(messages, {
+    ...baseOptions,
+    providerConfig: {
+      ...baseOptions.providerConfig,
+      gemini: { apiKey: "gemini-key", model: "gemini-3.8-flash" },
+    },
+  });
+
+  expect(reply).toMatchObject({ provider: "gemini", model: "gemini-3.8-flash" });
+  expect(other.doStreamCalls).toHaveLength(0);
+});
 
 it("checks text and image model availability concurrently", async () => {
   mocks.responses.mockReturnValue(scriptedModel());

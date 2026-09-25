@@ -1,4 +1,5 @@
 // Ported from SignLoop apps/web/lib/chat.ts at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
 import { withAbort } from "./bounded-response";
 import {
@@ -9,10 +10,12 @@ import {
   safeProviderFailureMetadata,
   type ProviderConfig,
   type LlmFallbackLogger,
+  type LlmProvider,
   type FetchImplementation,
   type SafeProviderFailure,
 } from "./llm-client";
 export const FIRST_CHUNK_TIMEOUT_MS = 20_000;
+const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
 type RoutedCandidate = ReturnType<ReturnType<typeof createOpenAI>["responses"]>;
 type StreamOptions = Parameters<RoutedCandidate["doStream"]>[0];
@@ -111,6 +114,31 @@ async function openStreamWithDeadline(
   }
 }
 
+/** Configured generation providers in the order each model step tries them. */
+export function listProviderCandidates(
+  config: Pick<ProviderConfig, "gemini" | "primary" | "openRouter">,
+): { provider: LlmProvider; model: string }[] {
+  return [
+    ...(config.gemini
+      ? [{ provider: "gemini" as const, model: config.gemini.model }]
+      : []),
+    ...(config.primary
+      ? [
+          {
+            provider: "primary-openai-compatible" as const,
+            model: config.primary.model,
+          },
+        ]
+      : []),
+    ...(config.openRouter
+      ? (config.openRouter.models ?? OPENROUTER_MODELS).map((model) => ({
+          provider: "openrouter" as const,
+          model,
+        }))
+      : []),
+  ];
+}
+
 // Switch providers only when opening a model step fails or the provider never starts answering.
 // Completed tool results remain in the agent's transcript; a stream that already delivered content
 // is never replayed on another provider. Exported for tests.
@@ -124,46 +152,58 @@ export function createRoutedModel(
 ) {
   const firstChunkTimeoutMs =
     options.firstChunkTimeoutMs ?? FIRST_CHUNK_TIMEOUT_MS;
-  const candidates = [
-    ...(config.primary
-      ? [
-          {
-            model: config.primary.model,
-            provider: "primary-openai-compatible" as const,
-            url: config.primary.baseURL,
-            key: config.primary.apiKey,
-          },
-        ]
-      : []),
-    ...(config.openRouter
-      ? (config.openRouter.models ?? OPENROUTER_MODELS).map((model) => ({
-          model,
-          provider: "openrouter" as const,
-          url: config.openRouter!.baseURL,
-          key: config.openRouter!.apiKey,
-        }))
-      : []),
-  ];
-  if (!candidates.length) throw new GenerationUnavailableError([]);
-  const failures: SafeProviderFailure[] = [];
-  const models = candidates.map((candidate) =>
+  const fetchImplementation = options.fetch ?? globalThis.fetch;
+  const openAiCompatible = (url: string, key: string, model: string) =>
     createOpenAI({
-      baseURL: candidate.url,
-      apiKey: candidate.key || "not-required",
+      baseURL: url,
+      apiKey: key,
       headers: {
         "HTTP-Referer": config.publicServiceUrl,
         "X-Title": config.appName,
       },
       fetch: createRestrictedProviderFetch({
-        fetch: options.fetch ?? globalThis.fetch,
-        apiKey: candidate.key || "not-required",
+        fetch: fetchImplementation,
+        apiKey: key,
         publicServiceUrl: config.publicServiceUrl,
         appName: config.appName,
       }) as typeof globalThis.fetch,
-    }).responses(candidate.model),
-  );
+    }).responses(model);
+  const languageModel = (
+    provider: LlmProvider,
+    model: string,
+  ): RoutedCandidate => {
+    switch (provider) {
+      case "gemini":
+        // Explicit key and base URL keep ambient GOOGLE_GENERATIVE_AI_* settings out of routing.
+        // Gemini authenticates with x-goog-api-key, so the OpenAI-shaped restricted fetch
+        // (which rebuilds a Bearer header) does not apply here.
+        return createGoogleGenerativeAI({
+          apiKey: config.gemini!.apiKey,
+          baseURL: GEMINI_BASE_URL,
+          fetch: fetchImplementation as typeof globalThis.fetch,
+        }).languageModel(model);
+      case "primary-openai-compatible":
+        return openAiCompatible(
+          config.primary!.baseURL,
+          config.primary!.apiKey || "not-required",
+          model,
+        );
+      case "openrouter":
+        return openAiCompatible(
+          config.openRouter!.baseURL,
+          config.openRouter!.apiKey || "not-required",
+          model,
+        );
+    }
+  };
+  const candidates = listProviderCandidates(config).map((candidate) => ({
+    ...candidate,
+    languageModel: languageModel(candidate.provider, candidate.model),
+  }));
+  if (!candidates.length) throw new GenerationUnavailableError([]);
+  const failures: SafeProviderFailure[] = [];
   let index = 0;
-  const base = models[0]!;
+  const base = candidates[0]!.languageModel;
   async function attempt<T>(
     signal: AbortSignal | undefined,
     run: (candidate: RoutedCandidate) => PromiseLike<T>,
@@ -171,7 +211,7 @@ export function createRoutedModel(
     for (;;) {
       signal?.throwIfAborted();
       try {
-        return await run(models[index]!);
+        return await run(candidates[index]!.languageModel);
       } catch (error) {
         if (signal?.aborted) throw error;
         const candidate = candidates[index]!;
@@ -186,7 +226,7 @@ export function createRoutedModel(
           ...failure,
         });
         if (
-          index === models.length - 1 ||
+          index === candidates.length - 1 ||
           (candidate.provider === "openrouter" &&
             !isEligibleOpenRouterFallback(error))
         ) {
@@ -197,7 +237,10 @@ export function createRoutedModel(
     }
   }
   return {
-    selected: () => candidates[index]!,
+    selected: () => ({
+      provider: candidates[index]!.provider,
+      model: candidates[index]!.model,
+    }),
     model: {
       specificationVersion: base.specificationVersion,
       provider: base.provider,

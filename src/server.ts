@@ -1,7 +1,19 @@
 import { getServiceConfig } from "./config";
-import { handleRequest } from "./handler";
+import { handleRequest, toProviderConfig } from "./handler";
+import { listProviderCandidates } from "./pipeline/agent-provider";
 
 const config = getServiceConfig();
+
+// Provider names and model IDs only: credentials and endpoint URLs never reach the logs.
+console.log(
+  JSON.stringify({
+    level: "info",
+    event: "generation_providers",
+    providers: listProviderCandidates(toProviderConfig(config)).map(
+      ({ provider, model }) => `${provider}:${model}`,
+    ),
+  }),
+);
 
 if (config.primaryLlm?.modelWasDefaulted) {
   console.warn(
