@@ -239,54 +239,6 @@ export async function parseBoundedJsonRequest<T>(
   }
 }
 
-/** Saved chats trust only the new user turn; earlier history is reconstructed from the database. */
-export function parseLatestClientUserMessage(
-  payload: unknown,
-): ParsedChatMessages {
-  if (!isRecord(payload)) {
-    return { ok: false, error: "Request body must be an object.", status: 400 };
-  }
-
-  const rawMessages = (payload as RequestPayload).messages;
-  if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
-    return { ok: false, error: "Chat requires a user message.", status: 400 };
-  }
-  if (rawMessages.length > MAX_CHAT_MESSAGES) {
-    return {
-      ok: false,
-      error: `Chat supports at most ${MAX_CHAT_MESSAGES} messages per request.`,
-      status: 413,
-    };
-  }
-
-  const latest = rawMessages.at(-1);
-  if (
-    !isRecord(latest) ||
-    latest.role !== "user" ||
-    typeof latest.content !== "string"
-  ) {
-    return {
-      ok: false,
-      error: "The final chat message must be from the user.",
-      status: 400,
-    };
-  }
-  if (latest.content.length > MAX_CHAT_MESSAGE_LENGTH) {
-    return {
-      ok: false,
-      error: `Each message must be at most ${MAX_CHAT_MESSAGE_LENGTH} characters.`,
-      status: 413,
-    };
-  }
-
-  const content = latest.content.trim();
-  if (!content) {
-    return { ok: false, error: "Messages cannot be empty.", status: 400 };
-  }
-
-  return { ok: true, messages: [{ role: "user", content }] };
-}
-
 /** Keep the newest canonical messages inside the same per-message and total character budgets. */
 export function boundCanonicalChatHistory(
   messages: readonly ChatMessage[],

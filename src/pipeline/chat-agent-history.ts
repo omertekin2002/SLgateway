@@ -7,6 +7,9 @@ export const MAX_AGENT_STATE_CHARACTERS = 20_000;
 export const MAX_SOURCE_CATALOG_CHARACTERS = 16_000;
 export const MAX_SOURCE_COUNT = 64;
 export const MAX_SOURCE_TITLE_CHARACTERS = 240;
+// Matches the canonical per-message limit. Replay replaces an assistant message's canonical content,
+// so a shorter clip would hide part of the previous answer whenever tools were used.
+const MAX_REPLAY_ANSWER_CHARACTERS = 4_000;
 
 /** Plain answers already live in canonical message content; replay adds no tool evidence. */
 export function isPlainAssistantReplay(
@@ -79,6 +82,10 @@ export function compactAgentMessages(
     text.length > 2_000
       ? `${text.slice(0, 2_000)}\n[Replay excerpt; read the source again for more detail.]`
       : text;
+  const clipAnswer = (text: string) =>
+    text.length > MAX_REPLAY_ANSWER_CHARACTERS
+      ? `${text.slice(0, MAX_REPLAY_ANSWER_CHARACTERS)}\n[Earlier answer shortened for replay.]`
+      : text;
   const groups: ModelMessage[][] = [];
   for (const message of parsed.data) {
     if (message.role === "assistant") {
@@ -87,10 +94,10 @@ export function compactAgentMessages(
           ...message,
           content:
             typeof message.content === "string"
-              ? clip(message.content)
+              ? clipAnswer(message.content)
               : message.content.map((part) =>
                   part.type === "text"
-                    ? { ...part, text: clip(part.text) }
+                    ? { ...part, text: clipAnswer(part.text) }
                     : part,
                 ),
         },

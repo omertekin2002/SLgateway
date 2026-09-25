@@ -1,12 +1,5 @@
 import OpenAI from "openai";
 
-import {
-  discoverPrimaryModelAvailability,
-  type PrimaryModelAvailability,
-  type PrimaryModelDiscoveryConfig,
-  type PrimaryModelDiscoveryOptions,
-} from "./provider-models";
-
 // Adapted from SignLoop apps/web/lib/llm-client.ts.
 // Source commit: 5d06ed2630386c4a9af78373ce998d31dbc1f776
 // Environment reads were replaced with explicit configuration and injectable clients.
@@ -37,7 +30,6 @@ export type ProviderConfig = {
   readonly openRouter?: OpenRouterProviderConfig;
   readonly publicServiceUrl: string;
   readonly appName: string;
-  readonly timeoutMs?: number;
 };
 
 export type FetchImplementation = (
@@ -51,12 +43,6 @@ export type OpenAiCompatibleClientOptions = {
   readonly appName?: string;
   readonly fetch?: FetchImplementation;
 };
-
-export type OpenAiCompatibleClientFactory = (
-  baseURL: string,
-  apiKey?: string,
-  options?: OpenAiCompatibleClientOptions,
-) => OpenAI;
 
 export type LlmFallbackLogger = Pick<Console, "warn">;
 
@@ -101,26 +87,6 @@ export function createRestrictedProviderFetch(input: {
     // ambient OPENAI_CUSTOM_HEADERS escape hatch, including unrelated credential headers.
     return input.fetch.call(undefined, resource, { ...init, headers });
   };
-}
-
-/** A provider returned content that cannot safely be treated as a valid response. */
-export class LlmResponseValidationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "LlmResponseValidationError";
-  }
-}
-
-/** Safe provider HTTP failure used by direct OpenRouter streaming requests. */
-export class ProviderHttpError extends Error {
-  constructor(
-    readonly statusCode: number,
-    readonly providerCode?: string,
-    readonly upstreamRequestId?: string,
-  ) {
-    super("Generation provider request failed");
-    this.name = "ProviderHttpError";
-  }
 }
 
 /** All configured and eligible generation attempts were exhausted. */
@@ -217,14 +183,6 @@ export function safeProviderFailureMetadata(
   };
 }
 
-function logProviderFailure(
-  logger: LlmFallbackLogger,
-  message: string,
-  failure: SafeProviderFailure,
-): void {
-  logger.warn(message, { event: "provider_failure", ...failure });
-}
-
 export function validateProviderBaseUrl(baseURL: string): string {
   const resolvedBaseUrl = baseURL.trim();
   if (!resolvedBaseUrl) {
@@ -296,262 +254,4 @@ export function createOpenAiCompatibleClient(
       ...(options?.appName ? { appName: options.appName } : {}),
     }),
   });
-}
-
-export function extractResponseOutputText(
-  response: OpenAI.Responses.Response,
-): string | null {
-  const directOutputText =
-    typeof response.output_text === "string" ? response.output_text.trim() : "";
-  if (directOutputText) {
-    return directOutputText;
-  }
-
-  const chunks: string[] = [];
-  const outputItems = Array.isArray(response.output) ? response.output : [];
-
-  for (const outputItem of outputItems) {
-    if (typeof outputItem !== "object" || outputItem === null) continue;
-
-    const content = Array.isArray((outputItem as { content?: unknown }).content)
-      ? ((outputItem as { content?: unknown[] }).content ?? [])
-      : [];
-
-    for (const part of content) {
-      if (typeof part !== "object" || part === null) continue;
-      const candidate = part as { type?: unknown; text?: unknown };
-      if (
-        candidate.type === "output_text" &&
-        typeof candidate.text === "string"
-      ) {
-        chunks.push(candidate.text);
-      }
-    }
-  }
-
-  const joined = chunks.join("").trim();
-  return joined.length > 0 ? joined : null;
-}
-
-export function resolvePrimaryModel(
-  requested: string | null | undefined,
-  configured: string | null | undefined,
-): string {
-  if (typeof requested === "string" && requested.trim()) {
-    return requested.trim();
-  }
-  if (typeof configured === "string" && configured.trim()) {
-    return configured.trim();
-  }
-  throw new Error("Primary LLM model is not configured");
-}
-
-function isAbortError(error: unknown, signal?: AbortSignal): boolean {
-  if (signal?.aborted) return true;
-  return (
-    error instanceof Error &&
-    (error.name === "AbortError" || error.name === "APIUserAbortError")
-  );
-}
-
-function abortReason(signal: AbortSignal): unknown {
-  return (
-    signal.reason ?? new DOMException("The operation was aborted", "AbortError")
-  );
-}
-
-export type ProviderExecutionScope = Readonly<{
-  signal: AbortSignal;
-  cleanup(): void;
-}>;
-
-/** One deadline shared by primary discovery, primary generation, and every fallback attempt. */
-export function createProviderExecutionScope(
-  parentSignal?: AbortSignal,
-  timeoutMs = 60_000,
-): ProviderExecutionScope {
-  const controller = new AbortController();
-  const onAbort = () => controller.abort(parentSignal?.reason);
-  if (parentSignal?.aborted) onAbort();
-  else parentSignal?.addEventListener("abort", onAbort, { once: true });
-
-  const timeout = setTimeout(() => {
-    controller.abort(
-      new DOMException("Generation request timed out", "TimeoutError"),
-    );
-  }, timeoutMs);
-
-  return {
-    signal: controller.signal,
-    cleanup() {
-      clearTimeout(timeout);
-      parentSignal?.removeEventListener("abort", onAbort);
-    },
-  };
-}
-
-function configuredOpenRouterModels(
-  config: OpenRouterProviderConfig,
-): readonly string[] {
-  const configured = config.models
-    ?.map((model) => model.trim())
-    .filter((model) => model.length > 0);
-  return configured?.length ? configured : OPENROUTER_MODELS;
-}
-
-function clientOptions(
-  config: ProviderConfig,
-  fetchImplementation?: FetchImplementation,
-): OpenAiCompatibleClientOptions {
-  return {
-    timeoutMs: config.timeoutMs,
-    publicServiceUrl: config.publicServiceUrl,
-    appName: config.appName,
-    ...(fetchImplementation ? { fetch: fetchImplementation } : {}),
-  };
-}
-
-export type RunWithFallbackOptions = {
-  readonly primaryModel?: string | null;
-  readonly signal?: AbortSignal;
-  readonly shouldFallback?: (error: unknown) => boolean;
-  readonly createClient?: OpenAiCompatibleClientFactory;
-  readonly fetch?: FetchImplementation;
-  readonly logger?: LlmFallbackLogger;
-  readonly discoverModel?: (
-    config: PrimaryModelDiscoveryConfig,
-    options?: PrimaryModelDiscoveryOptions,
-  ) => Promise<PrimaryModelAvailability>;
-};
-
-/**
- * Runs one operation against the configured primary provider, then each OpenRouter
- * model in order. Aborts and errors rejected by shouldFallback are never retried.
- */
-export async function runWithPrimaryAndOpenRouterFallback<T>(
-  config: ProviderConfig,
-  run: (client: OpenAI, model: string, signal: AbortSignal) => Promise<T>,
-  options?: RunWithFallbackOptions,
-): Promise<{ result: T; provider: LlmProvider; model: string }> {
-  const createClient = options?.createClient ?? createOpenAiCompatibleClient;
-  const logger = options?.logger ?? console;
-  const openRouter = config.openRouter;
-  const scope = createProviderExecutionScope(options?.signal, config.timeoutMs);
-  const failures: SafeProviderFailure[] = [];
-
-  try {
-    if (config.primary) {
-      const primaryModel = resolvePrimaryModel(
-        options?.primaryModel,
-        config.primary.model,
-      );
-      const discoverModel =
-        options?.discoverModel ?? discoverPrimaryModelAvailability;
-      const availability = await discoverModel(config.primary, {
-        ...(options?.fetch ? { fetch: options.fetch } : {}),
-        signal: scope.signal,
-      });
-
-      if (availability === "unavailable") {
-        const failure: SafeProviderFailure = {
-          provider: "primary-openai-compatible",
-          model: primaryModel,
-          errorClass: "ModelUnavailableError",
-          providerCode: "model_not_available",
-        };
-        failures.push(failure);
-        logger.warn(
-          "Configured primary model is not advertised by the provider",
-          {
-            event: "provider_model_unavailable",
-            ...failure,
-          },
-        );
-      } else {
-        try {
-          const primaryClient = createClient(
-            config.primary.baseURL,
-            config.primary.apiKey,
-            clientOptions(config, options?.fetch),
-          );
-          const result = await run(primaryClient, primaryModel, scope.signal);
-          return {
-            result,
-            provider: "primary-openai-compatible",
-            model: primaryModel,
-          };
-        } catch (error) {
-          if (isAbortError(error, scope.signal)) {
-            throw scope.signal.aborted ? abortReason(scope.signal) : error;
-          }
-          if (options?.shouldFallback && !options.shouldFallback(error)) {
-            throw error;
-          }
-
-          const failure = safeProviderFailureMetadata(
-            "primary-openai-compatible",
-            primaryModel,
-            error,
-          );
-          failures.push(failure);
-          logProviderFailure(
-            logger,
-            "Primary LLM call failed, falling back to OpenRouter",
-            failure,
-          );
-        }
-      }
-    }
-
-    if (!openRouter?.apiKey.trim()) {
-      throw new GenerationUnavailableError(failures);
-    }
-
-    const fallbackClient = createClient(
-      openRouter.baseURL,
-      openRouter.apiKey,
-      clientOptions(config, options?.fetch),
-    );
-    const fallbackModels = configuredOpenRouterModels(openRouter);
-
-    for (const fallbackModel of fallbackModels) {
-      try {
-        const result = await run(fallbackClient, fallbackModel, scope.signal);
-        if (fallbackModel !== fallbackModels[0]) {
-          logger.warn(
-            "OpenRouter fallback model succeeded after earlier model failed",
-            {
-              event: "provider_fallback_succeeded",
-              provider: "openrouter",
-              firstFallbackModel: fallbackModels[0],
-              successfulFallbackModel: fallbackModel,
-            },
-          );
-        }
-        return { result, provider: "openrouter", model: fallbackModel };
-      } catch (error) {
-        if (isAbortError(error, scope.signal)) {
-          throw scope.signal.aborted ? abortReason(scope.signal) : error;
-        }
-        if (options?.shouldFallback && !options.shouldFallback(error)) {
-          throw error;
-        }
-
-        const failure = safeProviderFailureMetadata(
-          "openrouter",
-          fallbackModel,
-          error,
-        );
-        failures.push(failure);
-        logProviderFailure(logger, "OpenRouter fallback model failed", failure);
-        if (!isEligibleOpenRouterFallback(error)) {
-          throw new GenerationUnavailableError(failures);
-        }
-      }
-    }
-
-    throw new GenerationUnavailableError(failures);
-  } finally {
-    scope.cleanup();
-  }
 }

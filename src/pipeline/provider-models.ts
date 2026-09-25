@@ -3,6 +3,9 @@ import { readBoundedJson } from "./bounded-response";
 
 export const PRIMARY_MODEL_DISCOVERY_TIMEOUT_MS = 7_500;
 export const PRIMARY_MODEL_DISCOVERY_CACHE_TTL_MS = 5 * 60_000;
+// Unknown still attempts primary, so remembering it changes no routing. It only stops a slow or
+// unsupported /models endpoint from delaying every request, while recovering quickly.
+export const PRIMARY_MODEL_DISCOVERY_UNKNOWN_CACHE_TTL_MS = 60_000;
 
 export type PrimaryModelAvailability = "available" | "unavailable" | "unknown";
 
@@ -22,11 +25,12 @@ export type PrimaryModelDiscoveryOptions = Readonly<{
   signal?: AbortSignal;
   timeoutMs?: number;
   cacheTtlMs?: number;
+  unknownCacheTtlMs?: number;
   now?: () => number;
 }>;
 
 type CachedAvailability = {
-  availability: Exclude<PrimaryModelAvailability, "unknown">;
+  availability: PrimaryModelAvailability;
   expiresAt: number;
 };
 
@@ -53,6 +57,7 @@ function modelIds(payload: unknown): string[] | null {
 /**
  * Advisory OpenAI-compatible /models check. Only a valid successful model list can skip primary;
  * unsupported endpoints, malformed responses, and transient failures all return unknown.
+ * Caller cancellation is never cached.
  */
 export async function discoverPrimaryModelAvailability(
   config: PrimaryModelDiscoveryConfig,
@@ -67,13 +72,25 @@ export async function discoverPrimaryModelAvailability(
   if (options.signal?.aborted) throw abortReason(options.signal);
   const fetchImplementation = options.fetch ?? globalThis.fetch;
   if (typeof fetchImplementation !== "function") return "unknown";
+  const remember = (
+    availability: PrimaryModelAvailability,
+  ): PrimaryModelAvailability => {
+    availabilityCache.set(cacheKey, {
+      availability,
+      expiresAt:
+        now +
+        (availability === "unknown"
+          ? (options.unknownCacheTtlMs ??
+            PRIMARY_MODEL_DISCOVERY_UNKNOWN_CACHE_TTL_MS)
+          : (options.cacheTtlMs ?? PRIMARY_MODEL_DISCOVERY_CACHE_TTL_MS)),
+    });
+    return availability;
+  };
 
   const controller = new AbortController();
-  let discoveryTimedOut = false;
   const onAbort = () => controller.abort(options.signal?.reason);
   options.signal?.addEventListener("abort", onAbort, { once: true });
   const timeout = setTimeout(() => {
-    discoveryTimedOut = true;
     controller.abort(
       new DOMException("Model discovery timed out", "TimeoutError"),
     );
@@ -93,23 +110,14 @@ export async function discoverPrimaryModelAvailability(
         signal: controller.signal,
       },
     );
-    if (!response.ok) return "unknown";
+    if (!response.ok) return remember("unknown");
 
     const ids = modelIds(await readBoundedJson(response, controller.signal));
-    if (!ids) return "unknown";
-    const availability = ids.includes(config.model)
-      ? "available"
-      : "unavailable";
-    availabilityCache.set(cacheKey, {
-      availability,
-      expiresAt:
-        now + (options.cacheTtlMs ?? PRIMARY_MODEL_DISCOVERY_CACHE_TTL_MS),
-    });
-    return availability;
-  } catch (error) {
+    if (!ids) return remember("unknown");
+    return remember(ids.includes(config.model) ? "available" : "unavailable");
+  } catch {
     if (options.signal?.aborted) throw abortReason(options.signal);
-    if (discoveryTimedOut) return "unknown";
-    return "unknown";
+    return remember("unknown");
   } finally {
     clearTimeout(timeout);
     options.signal?.removeEventListener("abort", onAbort);

@@ -205,3 +205,58 @@ it("preserves source IDs independently when replay is too large for the history 
     ])[0],
   ).toEqual({ role: "assistant", content: "Answer", webSources: sources });
 });
+
+it("replays an earlier answer at its canonical length and marks only longer ones", () => {
+  const exchange = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: "c1",
+          toolName: "read_url",
+          input: { url: "https://source.test/" },
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "c1",
+          toolName: "read_url",
+          output: { type: "json", value: { content: "Evidence" } },
+        },
+      ],
+    },
+  ];
+  const answerText = (replay: ReturnType<typeof compactAgentMessages>) => {
+    const answer = replay?.at(-1);
+    if (answer?.role !== "assistant") return undefined;
+    return typeof answer.content === "string"
+      ? answer.content
+      : answer.content
+          .map((part) => (part.type === "text" ? part.text : ""))
+          .join("");
+  };
+
+  const complete = "a".repeat(3_500);
+  expect(
+    answerText(
+      compactAgentMessages([
+        ...exchange,
+        { role: "assistant", content: [{ type: "text", text: complete }] },
+      ]),
+    ),
+  ).toBe(complete);
+
+  const clipped = compactAgentMessages([
+    ...exchange,
+    { role: "assistant", content: "b".repeat(5_000) },
+  ]);
+  expect(answerText(clipped)).toBe(
+    `${"b".repeat(4_000)}\n[Earlier answer shortened for replay.]`,
+  );
+  expect(parseAgentMessages(clipped)).toEqual(clipped);
+});

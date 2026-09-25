@@ -13,7 +13,7 @@ describe("loadServiceConfig", () => {
     expect(config.port).toBe(10_000);
     expect(config.maxConcurrentRequests).toBe(4);
     expect(config.requestTimeoutMs).toBe(275_000);
-    expect(config.geminiSearchModel).toBe("gemini-2.5-flash");
+    expect(config.webTools.geminiModel).toBe("gemini-2.5-flash");
     expect(config.openRouter?.models).toEqual(OPENROUTER_FALLBACK_MODELS);
     expect(config.publicServiceUrl).toBe("http://localhost:10000");
   });
@@ -51,7 +51,7 @@ describe("loadServiceConfig", () => {
       PRIMARY_LLM_MODEL: "provider/supported-model",
     });
 
-    expect(config.geminiApiKey).toBeNull();
+    expect(config.webTools.geminiApiKey).toBeNull();
     expect(config.primaryLlm).toMatchObject({
       model: "provider/supported-model",
       modelWasDefaulted: false,
@@ -142,7 +142,7 @@ describe("loadServiceConfig", () => {
       loadServiceConfig({
         ...minimumEnvironment,
         GEMINI_SEARCH_MODEL: "models/gemini-2.5-flash",
-      }).geminiSearchModel,
+      }).webTools.geminiModel,
     ).toBe("gemini-2.5-flash");
   });
 });

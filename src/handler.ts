@@ -17,7 +17,6 @@ import {
   parseBoundedJsonRequest,
   parseClientChatMessages,
 } from "./pipeline/chat-policy";
-import { GeminiWebSearchError } from "./pipeline/gemini-search";
 import {
   GenerationUnavailableError,
   type ProviderConfig,
@@ -207,7 +206,6 @@ function toProviderConfig(config: ServiceConfig): ProviderConfig {
       : {}),
     publicServiceUrl: config.publicServiceUrl,
     appName: config.appName,
-    timeoutMs: config.requestTimeoutMs,
   };
 }
 
@@ -374,10 +372,9 @@ function publicPipelineError(
   ) {
     return { status: 504, message: TIMEOUT_ERROR, code: "request_timeout" };
   }
-  if (
-    error instanceof GeminiWebSearchError ||
-    error instanceof ResearchUnavailableError
-  ) {
+  // Search failures are returned to the model as tool errors; only the strict-research check
+  // itself reaches this boundary.
+  if (error instanceof ResearchUnavailableError) {
     return {
       status: 502,
       message: "Grounded research is temporarily unavailable.",

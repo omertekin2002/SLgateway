@@ -9,16 +9,14 @@ import {
 } from "../src/handler";
 import type { ChatReply } from "../src/pipeline/chat";
 import { MAX_CHAT_REQUEST_BODY_BYTES } from "../src/pipeline/chat-policy";
-import { GeminiWebSearchError } from "../src/pipeline/gemini-search";
 import { GenerationUnavailableError } from "../src/pipeline/llm-client";
+import { ResearchUnavailableError } from "../src/pipeline/research-policy";
 import { DEFAULT_CHAT_ERROR_MESSAGE } from "../src/prompts";
 
 const TEST_URL = "http://service.test";
 
 function makeConfig(overrides: Partial<ServiceConfig> = {}): ServiceConfig {
   return {
-    geminiApiKey: "gemini-secret-never-return",
-    geminiSearchModel: "gemini-test-model",
     primaryLlm: {
       baseUrl: "https://primary.internal.example/v1",
       apiKey: "primary-secret-never-return",
@@ -26,7 +24,10 @@ function makeConfig(overrides: Partial<ServiceConfig> = {}): ServiceConfig {
       modelWasDefaulted: false,
     },
     openRouter: null,
-    webTools: {},
+    webTools: {
+      geminiApiKey: "gemini-secret-never-return",
+      geminiModel: "gemini-test-model",
+    },
     imageGenerationEnabled: false,
     imageGenerationModel: "gpt-image-2",
     publicServiceUrl: TEST_URL,
@@ -462,10 +463,7 @@ describe("HTTP response contracts", () => {
       config: makeConfig(),
       pipeline: {
         generate: vi.fn<ChatPipeline["generate"]>(async () => {
-          throw new GeminiWebSearchError(
-            "private upstream research failure",
-            "ignored public message",
-          );
+          throw new ResearchUnavailableError();
         }),
         stream: vi.fn<ChatPipeline["stream"]>(),
       },
@@ -512,10 +510,7 @@ describe("HTTP response contracts", () => {
       pipeline: {
         generate: vi.fn<ChatPipeline["generate"]>(),
         stream: vi.fn<ChatPipeline["stream"]>(async function* () {
-          throw new GeminiWebSearchError(
-            "private upstream research failure",
-            "ignored public message",
-          );
+          throw new ResearchUnavailableError();
           yield undefined as never;
         }),
       },

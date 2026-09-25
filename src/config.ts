@@ -27,8 +27,6 @@ export type OpenRouterConfig = Readonly<{
 }>;
 
 export type ServiceConfig = Readonly<{
-  geminiApiKey: string | null;
-  geminiSearchModel: string;
   webTools: WebToolsConfig;
   imageGenerationEnabled: boolean;
   imageGenerationModel: string;
@@ -265,8 +263,6 @@ export function loadServiceConfig(
   );
 
   return Object.freeze({
-    geminiApiKey,
-    geminiSearchModel,
     webTools: Object.freeze({
       provider: searchProvider as WebToolsConfig["provider"],
       braveApiKey: integrationKey("BRAVE_SEARCH_API_KEY"),

@@ -94,6 +94,49 @@ describe("primary model discovery", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("briefly remembers unknown availability instead of rechecking on every request", async () => {
+    const fetchMock = vi.fn(
+      async () => new Response("not supported", { status: 404 }),
+    );
+    const discoverAt = (now: number) =>
+      discoverPrimaryModelAvailability(primary, {
+        fetch: fetchMock,
+        now: () => now,
+        unknownCacheTtlMs: 100,
+      });
+
+    await expect(discoverAt(1_000)).resolves.toBe("unknown");
+    await expect(discoverAt(1_099)).resolves.toBe("unknown");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(discoverAt(1_100)).resolves.toBe("unknown");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not remember a check the caller cancelled", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("request cancelled", "AbortError");
+    await expect(
+      discoverPrimaryModelAvailability(primary, {
+        signal: controller.signal,
+        fetch: async () => {
+          controller.abort(reason);
+          throw reason;
+        },
+      }),
+    ).rejects.toBe(reason);
+
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ data: [{ id: primary.model }] }), {
+          status: 200,
+        }),
+    );
+    await expect(
+      discoverPrimaryModelAvailability(primary, { fetch: fetchMock }),
+    ).resolves.toBe("available");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("propagates caller cancellation", async () => {
     const controller = new AbortController();
     const reason = new DOMException("request cancelled", "AbortError");

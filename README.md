@@ -185,7 +185,7 @@ Errors after the stream opens retain HTTP 200 and appear as a terminal event:
 
 ### Provider fallback and limits
 
-Primary model discovery remains advisory for text generation: a valid model list that excludes the configured model skips primary; unknown availability still attempts it. Definite results are cached for five minutes. All discovery and generation share the request deadline.
+Primary model discovery remains advisory for text generation: a valid model list that excludes the configured model skips primary; unknown availability still attempts it. Definite results are cached for five minutes; unknown results for one minute, so a slow or unsupported `/models` endpoint does not delay every request. Text and image model checks run concurrently. All discovery and generation share the request deadline.
 
 The agent uses SignLoop's 20-second stream-opening guard per candidate. Metadata-only streams do not satisfy it. A failed opening can move to the next configured provider; an already-opened step is never replayed. Completed tool results survive a provider switch on a later step. SDK automatic retries are disabled. Incomplete output, token-limit finishes, and EOF without full completion are rejected.
 
@@ -204,6 +204,10 @@ The agent uses SignLoop's 20-second stream-opening guard per candidate. Metadata
 | Source catalog                                             |         64 entries / 16000 serialized characters |
 | Image generations                                          |                          2 per turn when enabled |
 | Image payload                                              |                        8 MiB of base64 per image |
+
+Replay keeps each earlier assistant answer up to 4000 characters, matching canonical message content; tool results inside replay are excerpted at 2000 characters.
+
+The source catalog accumulates across a conversation. Once a new page cannot be numbered, `search_web`, `read_url`, and `http_get` return a tool error before contacting any provider, asking the model to answer from sources already read and suggest a new chat. Pages already in the catalog can still be read again as fresh evidence. In `always` mode, a turn that needs a new page then fails with `research_unavailable`.
 
 Public HTTP fetching validates each redirect and resolved socket address, blocks private/reserved IPs and credential-bearing URLs, and bounds response size. Requests to hosted readers also validate the requested URL. Retrieved text is marked as untrusted data.
 

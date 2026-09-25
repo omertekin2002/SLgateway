@@ -24,6 +24,8 @@ import {
   createHttpGetTool,
   createImageTool,
   createUrlReaderTool,
+  SOURCE_CATALOG_FULL_MESSAGE,
+  SourceCatalogFullError,
 } from "./chat-tools";
 import { verifyFigures, type FigureVerification } from "./web-citations";
 import { isRecord } from "../utils";
@@ -167,10 +169,20 @@ export async function* generateChatReplyStream(
       : {}),
   };
   let providerConfig = options.providerConfig;
-  if (
-    providerConfig.primary &&
-    (await discover(providerConfig.primary, discoveryOptions)) === "unavailable"
-  ) {
+  const imagePrimary = options.providerConfig.primary;
+  // Independent checks against the same endpoint: run them together so a slow /models is paid once.
+  const [textAvailability, imageAvailability] = await Promise.all([
+    providerConfig.primary
+      ? discover(providerConfig.primary, discoveryOptions)
+      : undefined,
+    options.imageGeneration?.enabled && imagePrimary
+      ? discover(
+          { ...imagePrimary, model: options.imageGeneration.model },
+          discoveryOptions,
+        )
+      : undefined,
+  ]);
+  if (providerConfig.primary && textAvailability === "unavailable") {
     options.dependencies?.logger?.warn(
       "Configured primary model is not advertised",
       {
@@ -182,15 +194,7 @@ export async function* generateChatReplyStream(
     );
     providerConfig = { ...providerConfig, primary: undefined };
   }
-  const imagePrimary = options.providerConfig.primary;
-  const imageEnabled = Boolean(
-    options.imageGeneration?.enabled &&
-    imagePrimary &&
-    (await discover(
-      { ...imagePrimary, model: options.imageGeneration.model },
-      discoveryOptions,
-    )) === "available",
-  );
+  const imageEnabled = imageAvailability === "available";
   signal.throwIfAborted();
   const routed = createRoutedModel(providerConfig, {
     firstChunkTimeoutMs: options.firstChunkTimeoutMs,
@@ -220,13 +224,21 @@ export async function* generateChatReplyStream(
         JSON.stringify([...sources, source]).length >
           MAX_SOURCE_CATALOG_CHARACTERS
       )
-        throw new Error("Source catalog limit reached");
+        throw new SourceCatalogFullError();
       index = sources.length;
       sources.push(source);
     }
     readThisTurn.add(index + 1);
     return index + 1;
   };
+  // The catalog only grows across a conversation. Once a new page cannot be numbered, stop paying
+  // for searches and reads whose results would be discarded. The title is unknown before a fetch,
+  // so this is a lower bound; addSource still enforces the exact limit.
+  const hasSourceRoom = (url = ""): boolean =>
+    sources.some((existing) => existing.url === url) ||
+    (sources.length < MAX_SOURCE_COUNT &&
+      JSON.stringify([...sources, { title: "", url }]).length <=
+        MAX_SOURCE_CATALOG_CHARACTERS);
   const toolNotes: string[] = [];
   const tools: ToolSet = {};
   if (enableResearch) {
@@ -239,6 +251,7 @@ export async function* generateChatReplyStream(
         const key = query.toLowerCase().replace(/\s+/g, " ").trim();
         const existing = cache.get(key);
         if (existing) return existing;
+        if (!hasSourceRoom()) return { error: SOURCE_CATALOG_FULL_MESSAGE };
         if (searches >= MAX_SEARCHES)
           return {
             error:
@@ -283,6 +296,7 @@ export async function* generateChatReplyStream(
         signal,
         config: options.webTools,
         addSource,
+        hasSourceRoom,
         onEvidence: (text) => evidence.push(text),
       }),
     );
@@ -295,6 +309,7 @@ export async function* generateChatReplyStream(
         signal,
         publicServiceUrl: options.providerConfig.publicServiceUrl,
         addSource,
+        hasSourceRoom,
         onEvidence: (text) => evidence.push(text),
       }),
     );

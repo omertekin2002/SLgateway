@@ -25,6 +25,10 @@ import {
   type ChatGenerationOptions,
   type ChatMessage,
 } from "../src/pipeline/chat";
+import {
+  MAX_SOURCE_CATALOG_CHARACTERS,
+  MAX_SOURCE_COUNT,
+} from "../src/pipeline/chat-agent-history";
 
 const usage = {
   inputTokens: {
@@ -731,6 +735,147 @@ it("keeps prior source numbers stable when another page is read", async () => {
     "New",
   ]);
   expect(reply.readSources).toEqual([2]);
+});
+
+it("stops searching and reading new pages once the source catalog is full", async () => {
+  const catalog = Array.from({ length: MAX_SOURCE_COUNT }, (_, index) => ({
+    title: `Source ${index + 1}`,
+    url: `https://s${index + 1}.test/`,
+  }));
+  mocks.readUrl.mockResolvedValue({
+    title: "Source 3",
+    url: "https://s3.test/",
+    content: "Evidence",
+    provider: "jina",
+    truncated: false,
+  });
+  const model = sequencedModel([
+    toolStep(0, "search_web", { query: "more sources" }),
+    toolStep(1, "read_url", { url: "https://new.test/" }),
+    toolStep(2, "read_url", { url: "https://s3.test/" }),
+  ]);
+  mocks.responses.mockReturnValue(model);
+
+  const reply = await generateReply(
+    [
+      { role: "assistant", content: "Earlier answer [1]", webSources: catalog },
+      ...messages,
+    ],
+    baseOptions,
+  );
+
+  expect(mocks.search).not.toHaveBeenCalled();
+  // A page that already has a number can still be read again as fresh evidence.
+  expect(mocks.readUrl.mock.calls.map((call) => call[0])).toEqual([
+    "https://s3.test/",
+  ]);
+  expect(JSON.stringify(model.doStreamCalls[3]?.prompt)).toContain(
+    "limit of numbered sources",
+  );
+  expect(reply.readSources).toEqual([3]);
+  expect(reply.webSearch?.sources).toHaveLength(MAX_SOURCE_COUNT);
+});
+
+it("explains a full catalog when a fetched page's title does not fit", async () => {
+  const newUrl = "https://new.test/";
+  const catalog = Array.from({ length: 50 }, (_, index) => ({
+    title: "t".repeat(240),
+    url: `https://s${index + 1}.test/`,
+  }));
+  // Leave room for the new address with an empty title, but not for its real title.
+  const spare =
+    MAX_SOURCE_CATALOG_CHARACTERS -
+    JSON.stringify([...catalog, { title: "", url: newUrl }]).length;
+  catalog[0]!.url += "p".repeat(spare - 5);
+  mocks.readUrl.mockResolvedValue({
+    title: "A page title longer than the remaining space",
+    url: newUrl,
+    content: "Evidence",
+    provider: "jina",
+    truncated: false,
+  });
+  const model = sequencedModel([toolStep(0, "read_url", { url: newUrl })]);
+  mocks.responses.mockReturnValue(model);
+
+  const reply = await generateReply(
+    [
+      { role: "assistant", content: "Earlier answer [1]", webSources: catalog },
+      ...messages,
+    ],
+    baseOptions,
+  );
+
+  expect(mocks.readUrl).toHaveBeenCalledOnce();
+  expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain(
+    "limit of numbered sources",
+  );
+  expect(reply.readSources).toEqual([]);
+  expect(reply.webSearch?.sources).toHaveLength(50);
+});
+
+it.each([
+  [401, false],
+  [503, true],
+] as const)(
+  "after an OpenRouter %i, trying the next fallback model is %s",
+  async (status, continues) => {
+    const failing = new MockLanguageModelV4({
+      doStream: async () => {
+        throw Object.assign(new Error("provider failure"), { status });
+      },
+    });
+    const next = scriptedModel();
+    mocks.responses.mockImplementation((model: string) =>
+      model === "fallback-two" ? next : failing,
+    );
+    const run = generateReply(messages, {
+      ...baseOptions,
+      providerConfig: {
+        ...baseOptions.providerConfig,
+        openRouter: {
+          ...baseOptions.providerConfig.openRouter!,
+          models: ["fallback-one", "fallback-two"],
+        },
+      },
+    });
+
+    if (continues) {
+      await expect(run).resolves.toMatchObject({
+        provider: "openrouter",
+        model: "fallback-two",
+      });
+    } else {
+      await expect(run).rejects.toThrow(/generation providers are unavailable/);
+    }
+    expect(next.doStreamCalls).toHaveLength(continues ? 1 : 0);
+  },
+);
+
+it("checks text and image model availability concurrently", async () => {
+  mocks.responses.mockReturnValue(scriptedModel());
+  const started: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  const reply = generateReply(messages, {
+    ...baseOptions,
+    imageGeneration: { enabled: true, model: "gpt-image-2" },
+    dependencies: {
+      discoverModel: async (config) => {
+        started.push(config.model);
+        await gate;
+        return "available";
+      },
+    },
+  });
+
+  await vi.waitFor(() => expect(started).toEqual(["primary", "gpt-image-2"]));
+  release();
+  await expect(reply).resolves.toMatchObject({
+    provider: "primary-openai-compatible",
+  });
 });
 
 it.each(["unavailable", "unknown"] as const)(
