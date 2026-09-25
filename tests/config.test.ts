@@ -61,17 +61,17 @@ describe("loadServiceConfig", () => {
   it("parses ordered OpenRouter models, removes duplicates, and rejects empty IDs", () => {
     const config = loadServiceConfig({
       ...minimumEnvironment,
-      OPENROUTER_FALLBACK_MODELS: "vendor/first, openrouter/free, vendor/first",
+      OPENROUTER_FALLBACK_MODELS: "vendor/first, vendor/second, vendor/first",
     });
 
     expect(config.openRouter?.models).toEqual([
       "vendor/first",
-      "openrouter/free",
+      "vendor/second",
     ]);
     expect(() =>
       loadServiceConfig({
         ...minimumEnvironment,
-        OPENROUTER_FALLBACK_MODELS: "vendor/first,,openrouter/free",
+        OPENROUTER_FALLBACK_MODELS: "vendor/first,,vendor/second",
       }),
     ).toThrow(/empty model IDs/i);
     expect(() =>

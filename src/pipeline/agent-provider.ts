@@ -1,9 +1,9 @@
 // Ported from SignLoop apps/web/lib/chat.ts at 3f830abaae4d47dedecabea3fca57a4899a8f688.
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { createOpenAI } from "@ai-sdk/openai";
+import { OPENROUTER_FALLBACK_MODELS } from "../config";
 import { withAbort } from "./bounded-response";
 import {
-  OPENROUTER_MODELS,
   GenerationUnavailableError,
   createRestrictedProviderFetch,
   isEligibleOpenRouterFallback,
@@ -147,7 +147,7 @@ export function listProviderCandidates(
         ]
       : []),
     ...(config.openRouter
-      ? (config.openRouter.models ?? OPENROUTER_MODELS).map((model) => ({
+      ? (config.openRouter.models ?? OPENROUTER_FALLBACK_MODELS).map((model) => ({
           provider: "openrouter" as const,
           model,
         }))

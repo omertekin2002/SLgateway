@@ -4,8 +4,6 @@ import OpenAI from "openai";
 // Source commit: 5d06ed2630386c4a9af78373ce998d31dbc1f776
 // Environment reads were replaced with explicit configuration and injectable clients.
 
-export const OPENROUTER_MODELS = ["openrouter/free"] as const;
-
 export type LlmProvider = "gemini" | "primary-openai-compatible" | "openrouter";
 
 /** Native Gemini API generation; tried before every other provider. */

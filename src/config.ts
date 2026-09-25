@@ -1,5 +1,5 @@
 export const OPENROUTER_FALLBACK_MODELS = Object.freeze([
-  "openrouter/free",
+  "nvidia/nemotron-3-ultra-550b-a55b:free",
 ] as const);
 
 export const MAX_OPENROUTER_FALLBACK_MODELS = 5;
