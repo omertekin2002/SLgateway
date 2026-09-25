@@ -1,6 +1,4 @@
-// Adapted from SignLoop apps/web/lib/chat-time.ts.
-// Source commit: 5d06ed2630386c4a9af78373ce998d31dbc1f776
-
+// Ported from SignLoop apps/web/lib/chat-time.ts at 3f830abaae4d47dedecabea3fca57a4899a8f688.
 export function buildAuthoritativeUtcTimeContext(
   now: Date = new Date(),
 ): string {

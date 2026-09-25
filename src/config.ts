@@ -4,6 +4,15 @@ export const OPENROUTER_FALLBACK_MODELS = Object.freeze([
 
 export const MAX_OPENROUTER_FALLBACK_MODELS = 5;
 
+export type WebToolsConfig = Readonly<{
+  provider?: "brave" | "firecrawl" | "gemini";
+  braveApiKey?: string | null;
+  firecrawlApiKey?: string | null;
+  jinaApiKey?: string | null;
+  geminiApiKey?: string | null;
+  geminiModel?: string;
+}>;
+
 export type PrimaryLlmConfig = Readonly<{
   baseUrl: string;
   apiKey: string;
@@ -20,6 +29,9 @@ export type OpenRouterConfig = Readonly<{
 export type ServiceConfig = Readonly<{
   geminiApiKey: string | null;
   geminiSearchModel: string;
+  webTools: WebToolsConfig;
+  imageGenerationEnabled: boolean;
+  imageGenerationModel: string;
   primaryLlm: PrimaryLlmConfig | null;
   openRouter: OpenRouterConfig | null;
   publicServiceUrl: string;
@@ -62,7 +74,9 @@ function parsePositiveInteger(
 
   const parsed = Number(raw);
   if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > maximum) {
-    throw new Error(`${name} must be a positive integer no greater than ${maximum}`);
+    throw new Error(
+      `${name} must be a positive integer no greater than ${maximum}`,
+    );
   }
   return parsed;
 }
@@ -104,7 +118,9 @@ function parseOpenRouterModels(environment: Environment): readonly string[] {
 
   const entries = configured.split(",").map((model) => model.trim());
   if (!entries.length || entries.some((model) => !model)) {
-    throw new Error("OPENROUTER_FALLBACK_MODELS must not contain empty model IDs");
+    throw new Error(
+      "OPENROUTER_FALLBACK_MODELS must not contain empty model IDs",
+    );
   }
 
   const models = [...new Set(entries)].map((model) =>
@@ -126,7 +142,9 @@ function parseCorsOrigins(raw: string | null): ReadonlySet<string> {
     const candidate = configuredOrigin.trim();
     if (!candidate) continue;
     if (candidate === "*") {
-      throw new Error("CORS_ALLOWED_ORIGINS must contain explicit origins, not a wildcard");
+      throw new Error(
+        "CORS_ALLOWED_ORIGINS must contain explicit origins, not a wildcard",
+      );
     }
 
     let url: URL;
@@ -164,13 +182,19 @@ export function loadServiceConfig(
   const primaryApiKey = rawPrimaryApiKey
     ? credentialValue("PRIMARY_LLM_API_KEY", rawPrimaryApiKey)
     : null;
-  const configuredPrimaryModel = optionalValue(environment, "PRIMARY_LLM_MODEL");
+  const configuredPrimaryModel = optionalValue(
+    environment,
+    "PRIMARY_LLM_MODEL",
+  );
   const primaryModel = parseProviderModel(
     "PRIMARY_LLM_MODEL",
     configuredPrimaryModel ?? "gpt-5.6-luna",
   );
 
-  if ((primaryBaseUrl && !primaryApiKey) || (!primaryBaseUrl && primaryApiKey)) {
+  if (
+    (primaryBaseUrl && !primaryApiKey) ||
+    (!primaryBaseUrl && primaryApiKey)
+  ) {
     throw new Error(
       "PRIMARY_LLM_BASE_URL and PRIMARY_LLM_API_KEY must be configured together",
     );
@@ -208,6 +232,31 @@ export function loadServiceConfig(
   }
 
   const port = parsePositiveInteger(environment, "PORT", 10_000, 65_535);
+  const searchProvider = optionalValue(
+    environment,
+    "WEB_SEARCH_PROVIDER",
+  )?.toLowerCase();
+  if (
+    searchProvider &&
+    !["brave", "firecrawl", "gemini"].includes(searchProvider)
+  ) {
+    throw new Error("WEB_SEARCH_PROVIDER must be brave, firecrawl, or gemini");
+  }
+  const imageEnabled =
+    optionalValue(environment, "ENABLE_IMAGE_GENERATION") ?? "false";
+  if (imageEnabled !== "true" && imageEnabled !== "false") {
+    throw new Error("ENABLE_IMAGE_GENERATION must be true or false");
+  }
+  if (imageEnabled === "true" && !primaryLlm) {
+    throw new Error("ENABLE_IMAGE_GENERATION requires a primary LLM provider");
+  }
+  const integrationKey = (name: string) => {
+    const value = optionalValue(environment, name);
+    return value ? credentialValue(name, value) : null;
+  };
+  const geminiSearchModel = parseGeminiSearchModel(
+    optionalValue(environment, "GEMINI_SEARCH_MODEL") ?? "gemini-2.5-flash",
+  );
   const publicServiceUrl = parseHttpUrl(
     "PUBLIC_SERVICE_URL",
     optionalValue(environment, "PUBLIC_SERVICE_URL") ??
@@ -217,9 +266,19 @@ export function loadServiceConfig(
 
   return Object.freeze({
     geminiApiKey,
-    geminiSearchModel: parseGeminiSearchModel(
-      optionalValue(environment, "GEMINI_SEARCH_MODEL") ??
-        "gemini-2.5-flash",
+    geminiSearchModel,
+    webTools: Object.freeze({
+      provider: searchProvider as WebToolsConfig["provider"],
+      braveApiKey: integrationKey("BRAVE_SEARCH_API_KEY"),
+      firecrawlApiKey: integrationKey("FIRECRAWL_API_KEY"),
+      jinaApiKey: integrationKey("JINA_API_KEY"),
+      geminiApiKey,
+      geminiModel: geminiSearchModel,
+    }),
+    imageGenerationEnabled: imageEnabled === "true",
+    imageGenerationModel: parseProviderModel(
+      "IMAGE_GENERATION_MODEL",
+      optionalValue(environment, "IMAGE_GENERATION_MODEL") ?? "gpt-image-2",
     ),
     primaryLlm,
     openRouter,
@@ -238,7 +297,7 @@ export function loadServiceConfig(
     requestTimeoutMs: parsePositiveInteger(
       environment,
       "REQUEST_TIMEOUT_MS",
-      180_000,
+      275_000,
       3_600_000,
     ),
     corsAllowedOrigins: parseCorsOrigins(

@@ -4,10 +4,7 @@
 import { randomUUID } from "node:crypto";
 
 import { InferenceSemaphore, type ReleaseSlot } from "./concurrency";
-import {
-  getServiceConfig,
-  type ServiceConfig,
-} from "./config";
+import { getServiceConfig, type ServiceConfig } from "./config";
 import {
   generateChatReply,
   generateChatReplyStream,
@@ -27,12 +24,11 @@ import {
 } from "./pipeline/llm-client";
 import {
   parseResearchMode,
+  ResearchUnavailableError,
   type ResearchMode,
 } from "./pipeline/research-policy";
-import {
-  DEFAULT_CHAT_ERROR_MESSAGE,
-  appendWebSourcesToMessage,
-} from "./prompts";
+import { appendWebSourcesToMessage } from "./pipeline/web-citations";
+import { DEFAULT_CHAT_ERROR_MESSAGE } from "./prompts";
 import { isRecord } from "./utils";
 
 const SERVICE_NAME = "signloop-chat-service";
@@ -92,7 +88,9 @@ function defaultLog(entry: StructuredLogEntry): void {
 
 function safeErrorClass(error: unknown): string {
   const candidate =
-    error instanceof Error ? error.name || error.constructor.name : typeof error;
+    error instanceof Error
+      ? error.name || error.constructor.name
+      : typeof error;
   return /^[A-Za-z0-9_.-]{1,100}$/.test(candidate) ? candidate : "Error";
 }
 
@@ -130,7 +128,9 @@ function createExecutionScope(
 
   const timeout = setTimeout(() => {
     timedOut = true;
-    controller.abort(new DOMException("Service request timed out", "TimeoutError"));
+    controller.abort(
+      new DOMException("Service request timed out", "TimeoutError"),
+    );
   }, timeoutMs);
 
   return {
@@ -156,8 +156,7 @@ function createExecutionScope(
 
 function abortError(signal: AbortSignal): unknown {
   return (
-    signal.reason ??
-    new DOMException("The operation was aborted", "AbortError")
+    signal.reason ?? new DOMException("The operation was aborted", "AbortError")
   );
 }
 
@@ -219,14 +218,11 @@ function createConfiguredPipeline(
   const providerConfig = toProviderConfig(config);
   const optionsFor = (options: PipelineRequestOptions) => ({
     providerConfig,
-    ...(config.geminiApiKey
-      ? {
-          geminiSearch: {
-            apiKey: config.geminiApiKey,
-            model: config.geminiSearchModel,
-          },
-        }
-      : {}),
+    webTools: config.webTools,
+    imageGeneration: {
+      enabled: config.imageGenerationEnabled,
+      model: config.imageGenerationModel,
+    },
     signal: options.signal,
     researchMode: options.researchMode,
     dependencies: {
@@ -344,6 +340,7 @@ function canonicalMessage(reply: ChatReply): string {
   return appendWebSourcesToMessage(
     reply.message,
     reply.webSearch?.sources ?? [],
+    { readThisTurn: reply.readSources, figures: reply.figures },
   );
 }
 
@@ -356,6 +353,10 @@ function replyMetadata(reply: ChatReply): Record<string, unknown> {
     webSearchAttempts: reply.webSearch?.attemptedQueries ?? [],
     webSearchSuccessfulCount: reply.webSearch?.successfulSearches ?? 0,
     webSources: reply.webSearch?.sources ?? [],
+    agentMessages: reply.agentMessages,
+    toolActivity: reply.toolActivity ?? [],
+    readSources: reply.readSources ?? [],
+    figures: reply.figures,
   };
 }
 
@@ -367,10 +368,16 @@ function publicPipelineError(
   message: string;
   code: "research_unavailable" | "generation_unavailable" | "request_timeout";
 } {
-  if (scope.timedOut) {
+  if (
+    scope.timedOut ||
+    (error instanceof Error && error.name === "TimeoutError")
+  ) {
     return { status: 504, message: TIMEOUT_ERROR, code: "request_timeout" };
   }
-  if (error instanceof GeminiWebSearchError) {
+  if (
+    error instanceof GeminiWebSearchError ||
+    error instanceof ResearchUnavailableError
+  ) {
     return {
       status: 502,
       message: "Grounded research is temporarily unavailable.",
@@ -393,8 +400,11 @@ function publicPipelineError(
 
 function isJsonContentType(request: Request): boolean {
   return (
-    request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() ===
-    "application/json"
+    request.headers
+      .get("content-type")
+      ?.split(";", 1)[0]
+      ?.trim()
+      .toLowerCase() === "application/json"
   );
 }
 
@@ -497,8 +507,7 @@ export function createRequestHandler(
       status: number,
       extraHeaders?: Readonly<Record<string, string>>,
       logExtra?: Record<string, unknown>,
-    ): Response =>
-      respond({ error, code }, status, extraHeaders, logExtra);
+    ): Response => respond({ error, code }, status, extraHeaders, logExtra);
 
     if (request.method === "GET" && path === "/healthz") {
       return respond({ ok: true, service: SERVICE_NAME }, 200);
@@ -512,10 +521,7 @@ export function createRequestHandler(
 
       const headers = responseHeaders(request, config, requestId);
       headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-      headers.set(
-        "Access-Control-Allow-Headers",
-        "Content-Type, X-Request-ID",
-      );
+      headers.set("Access-Control-Allow-Headers", "Content-Type, X-Request-ID");
       headers.set("Access-Control-Max-Age", "600");
       finishLog(204);
       return new Response(null, { status: 204, headers });
@@ -562,13 +568,9 @@ export function createRequestHandler(
         scope.signal,
       );
       if (scope.timedOut) {
-        return respondError(
-          TIMEOUT_ERROR,
-          "request_timeout",
-          504,
-          undefined,
-          { errorClass: "TimeoutError" },
-        );
+        return respondError(TIMEOUT_ERROR, "request_timeout", 504, undefined, {
+          errorClass: "TimeoutError",
+        });
       }
       if (!parsedBody.ok) {
         return respondError(
@@ -660,12 +662,10 @@ export function createRequestHandler(
         }
 
         const message = canonicalMessage(reply);
-        return respond(
-          { message, ...replyMetadata(reply) },
-          200,
-          undefined,
-          { provider: reply.provider, model: reply.model },
-        );
+        return respond({ message, ...replyMetadata(reply) }, 200, undefined, {
+          provider: reply.provider,
+          model: reply.model,
+        });
       }
 
       const headers = responseHeaders(
@@ -690,10 +690,7 @@ export function createRequestHandler(
               .stream(parsedMessages.messages, pipelineOptions)
               [Symbol.asyncIterator]();
             for (;;) {
-              const result = await waitWithAbort(
-                iterator.next(),
-                scope.signal,
-              );
+              const result = await waitWithAbort(iterator.next(), scope.signal);
               if (result.done) break;
               const chunk = result.value;
 
@@ -705,6 +702,13 @@ export function createRequestHandler(
               if (chunk.type === "delta") {
                 controller.enqueue(
                   ndjsonEvent({ type: "delta", text: chunk.text }),
+                );
+                continue;
+              }
+
+              if (chunk.type === "tool") {
+                controller.enqueue(
+                  ndjsonEvent({ type: "tool", activity: chunk.activity }),
                 );
                 continue;
               }
@@ -724,7 +728,9 @@ export function createRequestHandler(
             }
 
             if (!terminalEventSent && !scope.cancelled) {
-              const message = scope.timedOut ? TIMEOUT_ERROR : STREAM_ENDED_ERROR;
+              const message = scope.timedOut
+                ? TIMEOUT_ERROR
+                : STREAM_ENDED_ERROR;
               controller.enqueue(
                 ndjsonEvent({
                   type: "error",

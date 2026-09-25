@@ -14,7 +14,13 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "openai": "^6.46.0"
+    "@ai-sdk/openai": "4.0.62",
+    "ai": "7.0.93",
+    "ipaddr.js": "2.5.0",
+    "marked": "18.0.6",
+    "openai": "^6.46.0",
+    "undici": "6.27.0",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",

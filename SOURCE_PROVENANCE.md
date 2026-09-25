@@ -1,30 +1,42 @@
 # Source provenance
 
-This service was extracted on **2026-07-22** from the following immutable SignLoop revision:
+The original service was extracted on 2026-07-22 from SignLoop commit `5d06ed2630386c4a9af78373ce998d31dbc1f776`. This update ports the current agentic engine from the immutable revision:
 
-- Local source checkout: `/Users/omertekin/Desktop/Grind/SignLoop`
-- GitHub repository: <https://github.com/omertekin2002/SignLoop>
-- Source commit: `5d06ed2630386c4a9af78373ce998d31dbc1f776`
-- Pinned tree: <https://github.com/omertekin2002/SignLoop/tree/5d06ed2630386c4a9af78373ce998d31dbc1f776>
+- Source checkout: `/Users/omertekin/Desktop/Grind/SignLoop`
+- Source commit: `3f830abaae4d47dedecabea3fca57a4899a8f688`
+- [Pinned source tree](https://github.com/omertekin2002/SignLoop/tree/3f830abaae4d47dedecabea3fca57a4899a8f688)
 
-Every source file was read from that commit. No generated files, local environment files, credentials, uploads, database configuration, or build output were copied.
+Source modules were read with `git show <commit>:<path>`. SignLoop's working tree and credentials were not modified or copied.
 
-## Adapted files
+## Directly ported modules
 
-| SignLoop source | Standalone destination | Adaptation |
-| --- | --- | --- |
-| `apps/web/lib/chat.ts` | `src/pipeline/chat.ts` | Retains UTC context, one-pass grounded research, generation, fallback, and streaming; accepts explicit runtime configuration and dependencies. |
-| `apps/web/lib/llm-client.ts` | `src/pipeline/llm-client.ts` | Retains OpenAI-compatible client validation and ordered primary/OpenRouter fallback; removes ambient application configuration. |
-| `apps/web/lib/gemini-search.ts` | `src/pipeline/gemini-search.ts` | Retains grounded Google research, source validation, bounded evidence, and prompt-injection defenses; accepts an explicit API key/model and abort signal. |
-| `apps/web/lib/chat-policy.ts` | `src/pipeline/chat-policy.ts` | Retains message/history/body limits, validation, incremental JSON parsing, and inline generated-image compaction. |
-| `apps/web/lib/chat-time.ts` | `src/pipeline/chat-time.ts` | Retains authoritative current UTC date/time context. |
-| `apps/web/app/api/chat/route.ts` | `src/prompts.ts`, `src/handler.ts` | Retains source-link attachment, safe errors, NDJSON events, and response metadata; removes chat identity prompts and replaces Next/Clerk/database behavior with a public HTTP boundary. |
-| `apps/web/lib/utils.ts` | `src/utils.ts` | Extracts only `isRecord` and `getErrorMessage`, avoiding UI dependencies. |
-| `apps/web/lib/chat.test.ts` | `tests/chat.test.ts` | Ports UTC, one-search, evidence reuse, fail-closed, delta, and streaming fallback coverage using injected providers. |
-| `apps/web/lib/chat-policy.test.ts` | `tests/chat-policy.test.ts` | Ports request/history limit, role validation, bounded-reader, and inline-image compaction coverage. |
-| `apps/web/lib/gemini-search.test.ts` | `tests/gemini-search.test.ts` | Ports grounded-response parsing, evidence safety, failure, timeout, cancellation, and redaction coverage. |
-| `apps/web/lib/llm-client.test.ts` | `tests/llm-client.test.ts` | Ports provider URL, response extraction, provider configuration, abort, and fallback-order coverage. |
+All source paths below are under `apps/web/lib/`; destinations are under `src/pipeline/`. Import paths and formatting are adapted throughout.
 
-`src/config.ts`, `src/concurrency.ts`, `src/server.ts`, the standalone parts of `src/handler.ts`, and their HTTP/configuration tests are new service-specific code rather than copied application infrastructure.
+| Source                      | Destination                    | Standalone adaptations                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `chat.ts`                   | `chat.ts`, `agent-provider.ts` | Preserve ToolLoopAgent, ten-step limit, tool progress, fallback between model steps, first-content deadline, completion validation, and image insertion. Split routing into its own module; use explicit provider/tool configuration; preserve gateway advisory model discovery and safe error metadata; implement `auto`/`always`/`never`; suppress SDK raw logging. |
+| `chat-tools.ts`             | `chat-tools.ts`                | Copy public page/API/image tools, caching, budgets, and evidence fences. Omit private contract tools and database imports. Supply explicit config. HTTP error bodies remain readable but do not satisfy strict fresh-evidence checks.                                                                                                                                 |
+| `web-search.ts`             | `web-search.ts`                | Preserve Brave/Firecrawl/Gemini selection, results parsing, limits, and error behavior; replace environment reads with configuration.                                                                                                                                                                                                                                 |
+| `gemini-search.ts`          | `gemini-search.ts`             | Copy query-based grounded search and bounded response parsing; accept explicit key/model. Replaces the old pre-generation research injection.                                                                                                                                                                                                                         |
+| `url-reader.ts`             | `url-reader.ts`                | Preserve Firecrawl/Jina behavior and guards; supply explicit keys; remove raw fallback logging.                                                                                                                                                                                                                                                                       |
+| `http-fetch.ts`             | `http-fetch.ts`                | Preserve redirect handling, bounded raw responses, and socket dispatcher; supply gateway public URL for identification.                                                                                                                                                                                                                                               |
+| `public-http-dispatcher.ts` | same                           | Preserve DNS validation at socket connection and explicit `undici/index.js` import for Bun.                                                                                                                                                                                                                                                                           |
+| `public-ip.ts`              | same                           | Preserve public-IP checks.                                                                                                                                                                                                                                                                                                                                            |
+| `bounded-response.ts`       | same                           | Preserve cancellation-aware bounded JSON/text reads.                                                                                                                                                                                                                                                                                                                  |
+| `chat-agent-history.ts`     | same                           | Preserve SDK replay validation, complete-exchange compaction, and source catalog bounds.                                                                                                                                                                                                                                                                              |
+| `chat-policy.ts`            | same                           | Preserve new replay/source-aware history parsing and transport bounds; retain gateway cancellation response semantics; exclude media and approval parts from public replay to prevent SDK downloads outside tool guards.                                                                                                                                              |
+| `chat-time.ts`              | same                           | Authoritative UTC context.                                                                                                                                                                                                                                                                                                                                            |
+| `web-citations.ts`          | same                           | Preserve stable citation numbers, source subsets, Markdown escaping, and figure provenance heuristic.                                                                                                                                                                                                                                                                 |
+| `image-generation.ts`       | same                           | Preserve primary image request/output behavior; explicit config, opt-in availability check in chat, bounded validated image payloads.                                                                                                                                                                                                                                 |
 
-The Next.js and React UI, Clerk authentication, Postgres persistence, saved threads, model settings UI, contracts/projects/uploads, image generation, Vercel Blob, and all runtime database bootstrapping were intentionally excluded. The SignLoop source worktree was not modified during extraction.
+The gateway retains its own startup configuration, HTTP routes, semaphore, request IDs, CORS, safe error codes, logging, and Render entry point. Its existing OpenAI client remains for image generation; SDK automatic retries are disabled. Provider-model discovery now uses the copied bounded response reader.
+
+Corresponding SignLoop tests were copied for agent behavior, wire serialization, search, URL/API tools, DNS guards, bounded reads, citations, replay, and images, adapting imports and explicit configuration. Private-contract and saved-title scenarios were excluded. Gateway-specific regressions cover strict research, real HTTP-to-agent integration, discovery, logging, and the existing public API.
+
+## Application-specific exclusions
+
+No Next.js/React UI, Clerk, Postgres, contract/project tools, uploads, saved threads, automatic titles, attachment persistence, application admission tables, or Langfuse exporters are imported. The gateway stays stateless and publicly callable. Optional images are returned inline rather than stored in SignLoop attachments.
+
+## Companion client
+
+`/Users/omertekin/Desktop/Grind/otekin` is updated separately to retain bounded tool replay/source catalogs, honor stable source numbers, allow the longer agent deadline, compact image history, and save generated images for terminal users. It remains dependency-free and uses non-streaming `/v1/chat`; `--json` preserves the full response. No release or deployment is performed by these source changes.

@@ -1,622 +1,789 @@
-import type OpenAI from "openai";
-import { describe, expect, it, vi } from "vitest";
+// Ported from SignLoop at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MockLanguageModelV4 } from "ai/test";
+import { simulateReadableStream } from "ai";
 
+const mocks = vi.hoisted(() => ({
+  search: vi.fn(),
+  responses: vi.fn(),
+  readUrl: vi.fn(),
+  generateImage: vi.fn(),
+}));
+vi.mock("@ai-sdk/openai", () => ({
+  createOpenAI: () => ({ responses: mocks.responses }),
+}));
+vi.mock("../src/pipeline/web-search", () => ({ searchWeb: mocks.search }));
+vi.mock("../src/pipeline/url-reader", () => ({ readUrl: mocks.readUrl }));
+vi.mock("../src/pipeline/image-generation", () => ({
+  generateImageReply: mocks.generateImage,
+}));
 import {
-  generateChatReply,
-  generateChatReplyStream,
-  type ChatMessage,
+  createRoutedModel,
+  generateChatReply as generateReply,
+  generateChatReplyStream as generateReplyStream,
   type ChatReplyStreamChunk,
+  type ChatGenerationOptions,
+  type ChatMessage,
 } from "../src/pipeline/chat";
-import {
-  GeminiWebSearchError,
-  type GeminiSearchMessage,
-  type GeminiWebSearchOptions,
-  type PreparedGeminiWebSearch,
-} from "../src/pipeline/gemini-search";
-import type {
-  FetchImplementation,
-  OpenAiCompatibleClientFactory,
-  ProviderConfig,
-} from "../src/pipeline/llm-client";
 
-const fixedNow = new Date("2026-07-13T08:15:30.000Z");
-const originalMessages: ChatMessage[] = [
-  { role: "system", content: "System prompt" },
-  { role: "user", content: "What changed?" },
-];
-const searchMetadata = {
-  query: "what changed today",
-  attemptedQueries: ["what changed today"],
-  successfulSearches: 1,
-  sources: [
-    {
-      title: "Current source",
-      url: "https://source.example/current",
-      snippet: "Current evidence",
-    },
-  ],
-};
-
-const fullProviderConfig: ProviderConfig = {
-  primary: {
-    baseURL: "https://primary.test/v1",
-    apiKey: "primary-key",
-    model: "primary/model",
+const usage = {
+  inputTokens: {
+    total: 1,
+    noCache: 1,
+    cacheRead: undefined,
+    cacheWrite: undefined,
   },
-  openRouter: {
-    baseURL: "https://openrouter.test/api/v1",
-    apiKey: "openrouter-key",
-    models: ["fallback/one", "fallback/two"],
-  },
-  publicServiceUrl: "https://service.test",
-  appName: "SignLoop Chat Service",
-  timeoutMs: 60_000,
+  outputTokens: { total: 1, text: 1, reasoning: undefined },
 };
-
-async function unknownModelDiscovery() {
-  return "unknown" as const;
-}
-
-function asOpenAi(create: ReturnType<typeof vi.fn>): OpenAI {
-  return { responses: { create } } as unknown as OpenAI;
-}
-
-function searchPreparer(
-  implementation?: (
-    messages: readonly GeminiSearchMessage[],
-    options: GeminiWebSearchOptions,
-  ) => Promise<PreparedGeminiWebSearch>,
+function streamStep(
+  index: number,
+  query?: string,
+  finishReason = query ? "tool-calls" : "stop",
 ) {
-  return vi.fn(
-    implementation ??
-      (async (messages: readonly GeminiSearchMessage[]) => ({
-        messages: messages.map((message, index) =>
-          index === messages.length - 1
-            ? {
-                ...message,
-                content: `${message.content}\n\nBEGIN_APPLICATION_WEB_RESEARCH_JSON\nCurrent evidence\nEND_APPLICATION_WEB_RESEARCH_JSON`,
-              }
-            : { ...message },
-        ),
-        webSearch: searchMetadata,
-      })),
-  );
+  return {
+    stream: simulateReadableStream({
+      initialDelayInMs: null,
+      chunkDelayInMs: null,
+      chunks: [
+        ...(query
+          ? [
+              {
+                type: "tool-call",
+                toolCallId: `call-${index}`,
+                toolName: "search_web",
+                input: JSON.stringify({ query }),
+              },
+            ]
+          : [
+              { type: "text-start", id: "text" },
+              { type: "text-delta", id: "text", delta: "Answer [1]" },
+              { type: "text-end", id: "text" },
+            ]),
+        {
+          type: "finish",
+          finishReason: { unified: finishReason, raw: undefined },
+          usage,
+        },
+      ],
+    }),
+  };
 }
-
-async function collectStream(
-  stream: AsyncGenerator<ChatReplyStreamChunk, void, void>,
-): Promise<ChatReplyStreamChunk[]> {
-  const chunks: ChatReplyStreamChunk[] = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return chunks;
+function toolStep(
+  index: number,
+  toolName: string,
+  input: Record<string, unknown>,
+) {
+  return {
+    stream: simulateReadableStream({
+      initialDelayInMs: null,
+      chunkDelayInMs: null,
+      chunks: [
+        {
+          type: "tool-call",
+          toolCallId: `call-${index}`,
+          toolName,
+          input: JSON.stringify(input),
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "tool-calls", raw: undefined },
+          usage,
+        },
+      ],
+    }),
+  };
 }
-
-describe("generateChatReply", () => {
-  it("injects authoritative current time without mutating caller messages", async () => {
-    const create = vi.fn().mockResolvedValue({ output_text: "Plain answer" });
-    const createClient = vi.fn(() => asOpenAi(create));
-
-    const reply = await generateChatReply(originalMessages, {
-      providerConfig: {
-        ...fullProviderConfig,
-        openRouter: undefined,
+type StepResult = Awaited<ReturnType<MockLanguageModelV4["doStream"]>>;
+function sequencedModel(steps: Array<ReturnType<typeof toolStep>>) {
+  const queue = [...steps];
+  return new MockLanguageModelV4({
+    doStream: async () => (queue.shift() ?? streamStep(99)) as StepResult,
+  });
+}
+function scriptedModel(queries: string[] = []) {
+  let index = 0;
+  const model = new MockLanguageModelV4({
+    doStream: async () =>
+      streamStep(index, queries[index++]) as Awaited<
+        ReturnType<MockLanguageModelV4["doStream"]>
+      >,
+  });
+  return model;
+}
+beforeEach(() => {
+  vi.resetAllMocks();
+  mocks.search.mockImplementation(async (query: string) => ({
+    provider: "brave",
+    query,
+    brief: null,
+    results: [
+      {
+        title: "Source",
+        url: "https://source.test",
+        snippet: `Evidence for ${query}`,
       },
-      enableWebSearch: false,
-      dependencies: {
-        createClient,
-        discoverModel: unknownModelDiscovery,
-        now: () => fixedNow,
-      },
-    });
+    ],
+  }));
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+const messages = [{ role: "user" as const, content: "Wazzup" }];
 
-    const input = create.mock.calls[0]?.[0]?.input as ChatMessage[];
-    expect(input[0]?.content).toContain(
-      "Current UTC timestamp: 2026-07-13T08:15:30.000Z",
+describe("agentic chat", () => {
+  it("lets the model answer a greeting without any search or classifier call", async () => {
+    const model = scriptedModel();
+    mocks.responses.mockReturnValue(model);
+    const reply = await generateChatReply(messages, { enableWebSearch: true });
+    expect(mocks.search).not.toHaveBeenCalled();
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(model.doStreamCalls[0]?.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: "search_web" })]),
     );
-    expect(input[0]?.content).toContain(
-      "dates before 2026-07-13 are in the past",
-    );
-    expect(originalMessages[0]?.content).toBe("System prompt");
-    expect(reply).toEqual({
-      message: "Plain answer",
-      provider: "primary-openai-compatible",
-      model: "primary/model",
-      webSearch: null,
-    });
+    expect(reply.webSearch).toBeNull();
+    expect(reply.agentMessages).toBeUndefined();
   });
 
-  it("prepends time context when no system message exists", async () => {
-    const create = vi.fn().mockResolvedValue({ output_text: "Timed answer" });
-    const userOnly: ChatMessage[] = [
-      { role: "user", content: "Was July 10 in the past?" },
-    ];
-
-    await generateChatReply(userOnly, {
-      providerConfig: { ...fullProviderConfig, openRouter: undefined },
-      enableWebSearch: false,
-      dependencies: {
-        createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
-        discoverModel: unknownModelDiscovery,
-        now: () => fixedNow,
+  it("uses complete canonical text instead of legacy clipped text-only replay", async () => {
+    const model = scriptedModel();
+    mocks.responses.mockReturnValue(model);
+    const answer = `${"x".repeat(3000)} The renewal deadline is September 30.`;
+    await generateChatReply([
+      { role: "user", content: "Explain the renewal terms." },
+      {
+        role: "assistant",
+        content: answer,
+        agentMessages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "text",
+                text: `${answer.slice(0, 2000)}\n[Replay excerpt]`,
+              },
+            ],
+          },
+        ],
       },
-    });
+      { role: "user", content: "What was that deadline?" },
+    ]);
 
-    const input = create.mock.calls[0]?.[0]?.input as ChatMessage[];
-    expect(input[0]).toMatchObject({ role: "system" });
-    expect(input[0]?.content).toContain(
-      "Current UTC calendar date: 2026-07-13",
+    const assistant = model.doStreamCalls[0]?.prompt.find(
+      (message) => message.role === "assistant",
     );
-    expect(input[1]).toEqual(userOnly[0]);
-    expect(userOnly).toEqual([
-      { role: "user", content: "Was July 10 in the past?" },
+    expect(assistant?.content).toEqual([
+      { type: "text", text: answer, providerOptions: undefined },
     ]);
   });
 
-  it("searches once and reuses identical evidence across fallback attempts", async () => {
-    const primaryCreate = vi.fn().mockRejectedValue(new Error("primary down"));
-    const fallbackCreate = vi.fn().mockResolvedValue({
-      output_text: "Fallback answer",
-    });
-    const createClient = vi.fn((baseURL: string) =>
-      baseURL.includes("primary")
-        ? asOpenAi(primaryCreate)
-        : asOpenAi(fallbackCreate),
+  it("executes successive model-selected searches and returns results to the model", async () => {
+    const model = scriptedModel(["first query", "refined query"]);
+    mocks.responses.mockReturnValue(model);
+    const chunks: ChatReplyStreamChunk[] = [];
+    for await (const chunk of generateChatReplyStream(messages, {
+      enableWebSearch: true,
+    }))
+      chunks.push(chunk);
+    expect(mocks.search.mock.calls.map((call) => call[0])).toEqual([
+      "first query",
+      "refined query",
+    ]);
+    expect(model.doStreamCalls).toHaveLength(3);
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain(
+      "Evidence for first query",
     );
-    const prepareWebSearch = searchPreparer();
-
-    const reply = await generateChatReply(originalMessages, {
-      providerConfig: fullProviderConfig,
-      researchMode: "always",
-      geminiSearch: {
-        apiKey: "gemini-key",
-        model: "gemini-search-model",
-        timeoutMs: 987,
-      },
-      dependencies: {
-        createClient,
-        discoverModel: unknownModelDiscovery,
-        prepareWebSearch,
-        now: () => fixedNow,
-        logger: { warn: vi.fn() },
-      },
-    });
-
-    expect(prepareWebSearch).toHaveBeenCalledOnce();
-    expect(prepareWebSearch.mock.calls[0]?.[1]).toMatchObject({
-      apiKey: "gemini-key",
-      model: "gemini-search-model",
-      timeoutMs: 987,
-      currentTime: fixedNow,
-    });
-    expect(primaryCreate.mock.calls[0]?.[0]?.input).toEqual(
-      fallbackCreate.mock.calls[0]?.[0]?.input,
+    expect(JSON.stringify(model.doStreamCalls[2]?.prompt)).toContain(
+      "Evidence for refined query",
     );
-    expect(reply).toEqual({
-      message: "Fallback answer",
-      provider: "openrouter",
-      model: "fallback/one",
-      webSearch: searchMetadata,
-    });
-  });
-
-  it("auto skips research for ordinary instructions", async () => {
-    const create = vi.fn().mockResolvedValue({ output_text: "diagnostic ok" });
-    const prepareWebSearch = searchPreparer();
-
-    const reply = await generateChatReply(
-      [{ role: "user", content: "Reply with exactly: diagnostic ok." }],
-      {
-        providerConfig: { ...fullProviderConfig, openRouter: undefined },
-        geminiSearch: { apiKey: "gemini-key" },
-        dependencies: {
-          createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
-          discoverModel: unknownModelDiscovery,
-          prepareWebSearch,
-        },
-      },
-    );
-
-    expect(prepareWebSearch).not.toHaveBeenCalled();
-    expect(reply.webSearch).toBeNull();
-  });
-
-  it("auto searches explicit current and source requests", async () => {
-    const create = vi.fn().mockResolvedValue({ output_text: "Current answer" });
-    const prepareWebSearch = searchPreparer();
-
-    const reply = await generateChatReply(
-      [{ role: "user", content: "What is the latest rule? Cite sources." }],
-      {
-        providerConfig: { ...fullProviderConfig, openRouter: undefined },
-        geminiSearch: { apiKey: "gemini-key" },
-        dependencies: {
-          createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
-          discoverModel: unknownModelDiscovery,
-          prepareWebSearch,
-        },
-      },
-    );
-
-    expect(prepareWebSearch).toHaveBeenCalledOnce();
-    expect(reply.webSearch).toEqual(searchMetadata);
-  });
-
-  it("auto falls through on invalid or transient research without injecting it", async () => {
-    const create = vi.fn().mockResolvedValue({ output_text: "Ungrounded answer" });
-    const createClient = (() => asOpenAi(create)) as OpenAiCompatibleClientFactory;
-    const searchError = new Error("Gemini search unavailable");
-    const prepareWebSearch = searchPreparer(async () => {
-      throw searchError;
-    });
-    const logger = { warn: vi.fn() };
-
-    const reply = await generateChatReply(
-      [{ role: "user", content: "Find current sources for this rule." }],
-      {
-        providerConfig: { ...fullProviderConfig, openRouter: undefined },
-        geminiSearch: { apiKey: "gemini-key" },
-        dependencies: {
-          createClient,
-          discoverModel: unknownModelDiscovery,
-          prepareWebSearch,
-          logger,
-        },
-      },
-    );
-
-    expect(reply.webSearch).toBeNull();
-    expect(create).toHaveBeenCalledOnce();
-    const generationInput = create.mock.calls[0]?.[0]?.input as ChatMessage[];
-    expect(JSON.stringify(generationInput)).not.toContain(
-      "BEGIN_APPLICATION_WEB_RESEARCH_JSON",
-    );
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.objectContaining({ event: "research_fallback" }),
-    );
-  });
-
-  it("auto falls through when Gemini returns no valid sources", async () => {
-    const create = vi.fn().mockResolvedValue({ output_text: "Ungrounded answer" });
-    const prepareWebSearch = searchPreparer(async () => {
-      throw new GeminiWebSearchError(
-        "Gemini web search returned no valid web sources",
-        "Grounded research is temporarily unavailable.",
-      );
-    });
-
-    const reply = await generateChatReply(
-      [{ role: "user", content: "Find current sources for this rule." }],
-      {
-        providerConfig: { ...fullProviderConfig, openRouter: undefined },
-        geminiSearch: { apiKey: "gemini-key" },
-        dependencies: {
-          createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
-          discoverModel: unknownModelDiscovery,
-          prepareWebSearch,
-          logger: { warn: vi.fn() },
-        },
-      },
-    );
-
-    expect(reply.webSearch).toBeNull();
-    expect(JSON.stringify(create.mock.calls[0]?.[0]?.input)).not.toContain(
-      "BEGIN_APPLICATION_WEB_RESEARCH_JSON",
-    );
-  });
-
-  it("always fails closed while never bypasses Gemini", async () => {
-    const create = vi.fn().mockResolvedValue({ output_text: "Plain answer" });
-    const createClient = (() => asOpenAi(create)) as OpenAiCompatibleClientFactory;
-    const searchError = new Error("Gemini search unavailable");
-    const prepareWebSearch = searchPreparer(async () => {
-      throw searchError;
-    });
-
-    await expect(
-      generateChatReply(originalMessages, {
-        providerConfig: { ...fullProviderConfig, openRouter: undefined },
-        researchMode: "always",
-        geminiSearch: { apiKey: "gemini-key" },
-        dependencies: { createClient, prepareWebSearch },
-      }),
-    ).rejects.toBe(searchError);
-    expect(create).not.toHaveBeenCalled();
-
-    const reply = await generateChatReply(originalMessages, {
-      providerConfig: { ...fullProviderConfig, openRouter: undefined },
-      researchMode: "never",
-      geminiSearch: { apiKey: "gemini-key" },
-      dependencies: {
-        createClient,
-        discoverModel: unknownModelDiscovery,
-        prepareWebSearch,
-      },
-    });
-    expect(reply.webSearch).toBeNull();
-    expect(prepareWebSearch).toHaveBeenCalledOnce();
-  });
-
-  it("never swallows request aborts or timeout aborts", async () => {
-    for (const name of ["AbortError", "TimeoutError"] as const) {
-      const controller = new AbortController();
-      const reason = new DOMException("request ended", name);
-      controller.abort(reason);
-      const prepareWebSearch = searchPreparer(async () => {
-        throw reason;
-      });
-
-      await expect(
-        generateChatReply(
-          [{ role: "user", content: "Find current sources." }],
-          {
-            providerConfig: fullProviderConfig,
-            geminiSearch: { apiKey: "gemini-key" },
-            signal: controller.signal,
-            dependencies: { createClient: vi.fn(), prepareWebSearch },
-          },
+    expect(chunks.filter((chunk) => chunk.type === "tool")).toHaveLength(4);
+    const done = chunks.at(-1);
+    expect(done?.type).toBe("done");
+    if (done?.type === "done") {
+      // Search returns leads, so nothing is citable until a page is actually read.
+      expect(done.reply.webSearch).toBeNull();
+      expect(
+        done.reply.agentMessages?.some((message) => message.role === "tool"),
+      ).toBe(true);
+      expect(
+        done.reply.toolActivity?.every(
+          (activity) => activity.status === "complete",
         ),
-      ).rejects.toBe(reason);
+      ).toBe(true);
     }
+  });
+
+  it("does not expose search when the session lacks access", async () => {
+    const model = scriptedModel();
+    mocks.responses.mockReturnValue(model);
+    await generateChatReply(messages);
+    expect(model.doStreamCalls[0]?.tools ?? []).toHaveLength(0);
+    expect(mocks.search).not.toHaveBeenCalled();
+  });
+
+  it("deduplicates repeated queries and bounds total search executions", async () => {
+    const model = scriptedModel(["A", "a", "B", "C", "D", "E", "F", "G", "H"]);
+    mocks.responses.mockReturnValue(model);
+    await generateChatReply(messages, { enableWebSearch: true });
+    expect(mocks.search.mock.calls.map((call) => call[0])).toEqual([
+      "A",
+      "B",
+      "C",
+    ]);
+    // Ten steps: nine tool rounds, then the final step is forced to answer without tools.
+    expect(model.doStreamCalls).toHaveLength(10);
+    expect(model.doStreamCalls[9]?.toolChoice).toEqual({ type: "none" });
+    expect(JSON.stringify(model.doStreamCalls[9]?.prompt)).toContain(
+      "budget exhausted",
+    );
+  });
+
+  it("returns search errors to the model without inventing evidence", async () => {
+    const model = scriptedModel(["query"]);
+    mocks.responses.mockReturnValue(model);
+    mocks.search.mockRejectedValue(new Error("secret internal error"));
+    const reply = await generateChatReply(messages, { enableWebSearch: true });
+    expect(reply.toolActivity?.[0]?.status).toBe("error");
+    expect(reply.webSearch).toBeNull();
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain(
+      "Web search failed",
+    );
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).not.toContain(
+      "secret internal error",
+    );
+  });
+
+  it("preserves completed tool results when the next model step needs fallback", async () => {
+    let calls = 0;
+    const primary = new MockLanguageModelV4({
+      doStream: async () => {
+        if (calls++) throw new Error("unavailable");
+        return streamStep(0, "query") as Awaited<
+          ReturnType<MockLanguageModelV4["doStream"]>
+        >;
+      },
+    });
+    const fallback = scriptedModel();
+    mocks.responses.mockImplementation((model: string) =>
+      model === "primary" ? primary : fallback,
+    );
+    const reply = await generateChatReply(messages, { enableWebSearch: true });
+    expect(reply.provider).toBe("openrouter");
+    expect(mocks.search).toHaveBeenCalledOnce();
+    expect(JSON.stringify(fallback.doStreamCalls[0]?.prompt)).toContain(
+      "Evidence for query",
+    );
+  });
+
+  it("replays saved tool exchanges on the next user turn", async () => {
+    mocks.responses.mockReturnValue(scriptedModel(["query"]));
+    const first = await generateChatReply(messages, { enableWebSearch: true });
+    const next = scriptedModel();
+    mocks.responses.mockReturnValue(next);
+    const nextReply = await generateChatReply(
+      [
+        ...messages,
+        {
+          role: "assistant",
+          content: first.message,
+          agentMessages: first.agentMessages,
+          webSources: first.webSearch?.sources,
+        },
+        { role: "user", content: "Explain that source" },
+      ],
+      { enableWebSearch: true },
+    );
+    expect(JSON.stringify(next.doStreamCalls[0]?.prompt)).toContain(
+      "Evidence for query",
+    );
+    expect(first.webSearch).toBeNull();
+    expect(nextReply.webSearch).toBeNull();
+  });
+
+  it("makes a searched page citable only after it is read", async () => {
+    mocks.readUrl.mockResolvedValue({
+      title: "Source",
+      url: "https://source.test",
+      content: "Supported fact",
+      truncated: false,
+      provider: "jina",
+    });
+    const model = sequencedModel([
+      toolStep(0, "search_web", { query: "isctr close" }),
+      toolStep(1, "read_url", { url: "https://source.test" }),
+    ]);
+    mocks.responses.mockReturnValue(model);
+    const reply = await generateChatReply(messages, {
+      enableWebSearch: true,
+      enableUrlReader: true,
+    });
+    // One source, contributed by the read rather than by the eight-result search.
+    expect(reply.webSearch?.sources).toEqual([
+      { title: "Source", url: "https://source.test" },
+    ]);
+  });
+
+  it("includes authoritative time and the selected personality without mutating input", async () => {
+    const model = scriptedModel();
+    mocks.responses.mockReturnValue(model);
+    const input = [
+      { role: "system" as const, content: "Bare LLM personality" },
+      ...messages,
+    ];
+    await generateChatReply(input);
+    expect(JSON.stringify(model.doStreamCalls[0]?.prompt)).toContain(
+      "Current UTC timestamp:",
+    );
+    expect(JSON.stringify(model.doStreamCalls[0]?.prompt)).toContain(
+      "Bare LLM personality",
+    );
+    expect(input[0]?.content).toBe("Bare LLM personality");
+  });
+
+  it("does not restart on fallback after a partial stream fails", async () => {
+    const primary = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          initialDelayInMs: null,
+          chunkDelayInMs: null,
+          chunks: [
+            { type: "text-start", id: "text" },
+            { type: "text-delta", id: "text", delta: "Partial answer" },
+            { type: "error", error: new Error("stream broke") },
+          ],
+        }),
+      }),
+    });
+    const fallback = scriptedModel();
+    mocks.responses.mockImplementation((name: string) =>
+      name === "primary" ? primary : fallback,
+    );
+    await expect(generateChatReply(messages)).rejects.toThrow("stream broke");
+    expect(fallback.doStreamCalls).toHaveLength(0);
+  });
+
+  it("rejects incomplete output instead of persisting it", async () => {
+    mocks.responses.mockReturnValue(
+      new MockLanguageModelV4({
+        doStream: async () =>
+          streamStep(0, undefined, "length") as Awaited<
+            ReturnType<MockLanguageModelV4["doStream"]>
+          >,
+      }),
+    );
+    await expect(generateChatReply(messages)).rejects.toThrow(
+      /did not complete/,
+    );
+  });
+
+  it("cancels the active run when the consumer stops reading", async () => {
+    const model = scriptedModel(["query"]);
+    mocks.responses.mockReturnValue(model);
+    const iterator = generateChatReplyStream(messages, {
+      enableWebSearch: true,
+    });
+    await iterator.next();
+    await iterator.return();
+    expect(model.doStreamCalls[0]?.abortSignal?.aborted).toBe(true);
+  });
+
+  it("fails over when the primary accepts the request but never starts a stream", async () => {
+    const primary = new MockLanguageModelV4({
+      doStream: () => new Promise(() => {}),
+    });
+    const fallback = scriptedModel();
+    mocks.responses.mockImplementation((name: string) =>
+      name === "primary" ? primary : fallback,
+    );
+    const reply = await generateChatReply(messages, {
+      firstChunkTimeoutMs: 20,
+    });
+    expect(reply.provider).toBe("openrouter");
+    expect(reply.message).toBe("Answer [1]");
+    expect(primary.doStreamCalls[0]?.abortSignal?.aborted).toBe(true);
+  });
+
+  it("fails over when the primary opens a stream that never delivers content", async () => {
+    const primary = new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: "stream-start", warnings: [] });
+          },
+        }),
+      }),
+    });
+    const fallback = scriptedModel();
+    mocks.responses.mockImplementation((name: string) =>
+      name === "primary" ? primary : fallback,
+    );
+    const reply = await generateChatReply(messages, {
+      firstChunkTimeoutMs: 20,
+    });
+    expect(reply.provider).toBe("openrouter");
+    expect(fallback.doStreamCalls).toHaveLength(1);
+  });
+
+  it("surfaces the timeout when every provider stays silent", async () => {
+    mocks.responses.mockReturnValue(
+      new MockLanguageModelV4({ doStream: () => new Promise(() => {}) }),
+    );
+    await expect(
+      generateChatReply(messages, { firstChunkTimeoutMs: 20 }),
+    ).rejects.toThrow(/generation providers are unavailable/);
+  });
+
+  it("falls back for non-streaming generation as well", async () => {
+    const primary = new MockLanguageModelV4({
+      doGenerate: async () => {
+        throw new Error("primary down");
+      },
+    });
+    const fallback = new MockLanguageModelV4({
+      doGenerate: async () => ({
+        content: [{ type: "text", text: "from fallback" }],
+        finishReason: { unified: "stop", raw: undefined },
+        usage,
+        warnings: [],
+      }),
+    });
+    mocks.responses.mockImplementation((name: string) =>
+      name === "primary" ? primary : fallback,
+    );
+    const routed = createRoutedModel(baseOptions.providerConfig);
+    const result = await routed.model.doGenerate({ prompt: [] });
+    expect(result.content).toEqual([{ type: "text", text: "from fallback" }]);
+    expect(routed.selected().provider).toBe("openrouter");
+    expect(primary.doGenerateCalls).toHaveLength(1);
+  });
+
+  it("reads a page on request and numbers it as a citable source", async () => {
+    mocks.readUrl.mockResolvedValue({
+      title: "Statute",
+      url: "https://law.test/statute",
+      content: "Section 1. Text of the statute.",
+      truncated: false,
+      provider: "jina",
+    });
+    const model = sequencedModel([
+      toolStep(0, "read_url", { url: "https://law.test/statute" }),
+    ]);
+    mocks.responses.mockReturnValue(model);
+    const reply = await generateChatReply(messages, { enableUrlReader: true });
+    expect(mocks.readUrl).toHaveBeenCalledWith(
+      "https://law.test/statute",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(reply.webSearch?.sources).toEqual([
+      { title: "Statute", url: "https://law.test/statute" },
+    ]);
+    const continuation = JSON.stringify(model.doStreamCalls[1]?.prompt);
+    expect(continuation).toContain("UNTRUSTED CONTENT");
+    expect(continuation).toContain("Text of the statute");
+    expect(reply.toolActivity).toEqual([
+      {
+        id: "call-0",
+        tool: "read_url",
+        query: "https://law.test/statute",
+        status: "complete",
+      },
+    ]);
+    expect(JSON.stringify(model.doStreamCalls[0]?.prompt)).toContain(
+      "read_url",
+    );
+  });
+
+  it("streams a generated image into the reply without putting bytes in the transcript", async () => {
+    const markdown = "![Generated image](data:image/png;base64,AAAA)";
+    mocks.generateImage.mockResolvedValue({
+      message: markdown,
+      model: "gpt-image-2",
+      provider: "primary-openai-compatible",
+    });
+    const model = sequencedModel([
+      toolStep(0, "generate_image", { prompt: "a signed contract on a desk" }),
+    ]);
+    mocks.responses.mockReturnValue(model);
+    const chunks: ChatReplyStreamChunk[] = [];
+    for await (const chunk of generateChatReplyStream(messages, {
+      enableImageGeneration: true,
+    }))
+      chunks.push(chunk);
+    expect(mocks.generateImage).toHaveBeenCalledWith(
+      "a signed contract on a desk",
+      expect.objectContaining({
+        model: "gpt-image-2",
+        providerConfig: baseOptions.providerConfig,
+      }),
+    );
+    const deltas = chunks
+      .filter((chunk) => chunk.type === "delta")
+      .map((chunk) => chunk.text);
+    expect(deltas[0]).toBe(markdown);
+    const done = chunks.at(-1);
+    if (done?.type !== "done") throw new Error("missing done");
+    expect(done.reply.message).toBe(`${markdown}\n\nAnswer [1]`);
+    expect(JSON.stringify(done.reply.agentMessages)).not.toContain("base64");
+    expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain(
+      '"attached"',
+    );
+    expect(done.reply.toolActivity).toEqual([
+      {
+        id: "call-0",
+        tool: "generate_image",
+        query: "a signed contract on a desk",
+        status: "complete",
+      },
+    ]);
+
+    const withoutImages = scriptedModel();
+    mocks.responses.mockReturnValue(withoutImages);
+    await generateChatReply(messages, { enableWebSearch: true });
+    expect(
+      withoutImages.doStreamCalls[0]?.tools?.map((item) => item.name),
+    ).toEqual(["search_web", "read_url", "http_get"]);
+  });
+
+  it("returns image failures to the model as tool errors", async () => {
+    mocks.generateImage.mockRejectedValue(
+      new Error("upstream 500 with secret details"),
+    );
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const model = sequencedModel([
+      toolStep(0, "generate_image", { prompt: "anything" }),
+    ]);
+    mocks.responses.mockReturnValue(model);
+    const reply = await generateChatReply(messages, {
+      enableImageGeneration: true,
+    });
+    expect(reply.message).toBe("Answer [1]");
+    expect(reply.toolActivity?.[0]?.status).toBe("error");
+    const continuation = JSON.stringify(model.doStreamCalls[1]?.prompt);
+    expect(continuation).toContain("Image generation failed");
+    expect(continuation).not.toContain("secret details");
+  });
+
+  it("supports an OpenRouter-only configuration", async () => {
+    mocks.responses.mockReturnValue(scriptedModel());
+    const reply = await generateReply(messages, {
+      ...baseOptions,
+      providerConfig: { ...baseOptions.providerConfig, primary: undefined },
+    });
+    expect(mocks.responses.mock.calls.map((call) => call[0])).toEqual([
+      "fallback",
+    ]);
+    expect(reply).toMatchObject({ provider: "openrouter", model: "fallback" });
   });
 });
 
-describe("generateChatReplyStream", () => {
-  it("preserves primary deltas and attaches search metadata to done", async () => {
-    async function* responseStream() {
-      yield { type: "response.output_text.delta", delta: "Live " };
-      yield { type: "response.output_text.delta", delta: "answer" };
-      yield { type: "response.output_text.done", text: "Live answer" };
-    }
+const baseOptions: ChatGenerationOptions = {
+  providerConfig: {
+    primary: {
+      baseURL: "https://primary.test/v1",
+      apiKey: "test",
+      model: "primary",
+    },
+    openRouter: {
+      baseURL: "https://fallback.test/v1",
+      apiKey: "test",
+      models: ["fallback"],
+    },
+    publicServiceUrl: "https://service.test",
+    appName: "Test gateway",
+  },
+  dependencies: { discoverModel: async () => "available" },
+};
+type UpstreamTestOptions = {
+  enableWebSearch?: boolean;
+  enableUrlReader?: boolean;
+  enableImageGeneration?: boolean;
+  firstChunkTimeoutMs?: number;
+};
+function optionsFor(options: UpstreamTestOptions = {}): ChatGenerationOptions {
+  return {
+    ...baseOptions,
+    researchMode:
+      options.enableWebSearch || options.enableUrlReader ? "auto" : "never",
+    imageGeneration: {
+      enabled: options.enableImageGeneration ?? false,
+      model: "gpt-image-2",
+    },
+    firstChunkTimeoutMs: options.firstChunkTimeoutMs,
+  };
+}
+const generateChatReply = (
+  messages: readonly ChatMessage[],
+  options?: UpstreamTestOptions,
+) => generateReply(messages, optionsFor(options));
+const generateChatReplyStream = (
+  messages: readonly ChatMessage[],
+  options?: UpstreamTestOptions,
+) => generateReplyStream(messages, optionsFor(options));
 
-    const create = vi.fn().mockResolvedValue(responseStream());
-    const prepareWebSearch = searchPreparer();
-    const chunks = await collectStream(
-      generateChatReplyStream(originalMessages, {
-        providerConfig: fullProviderConfig,
+it("auto exposes public research tools even for prompts without English keywords", async () => {
+  const model = scriptedModel();
+  mocks.responses.mockReturnValue(model);
+  await generateReply(
+    [{ role: "user", content: "Bugün İstanbul’da hava nasıl?" }],
+    baseOptions,
+  );
+  expect(model.doStreamCalls[0]?.tools?.map((tool) => tool.name)).toEqual([
+    "search_web",
+    "read_url",
+    "http_get",
+  ]);
+  expect(mocks.search).not.toHaveBeenCalled();
+});
+
+it("strict research rejects search-only answers without emitting answer deltas", async () => {
+  mocks.responses.mockReturnValue(scriptedModel(["fresh query"]));
+  const chunks: ChatReplyStreamChunk[] = [];
+  await expect(
+    (async () => {
+      for await (const chunk of generateReplyStream(messages, {
+        ...baseOptions,
         researchMode: "always",
-        geminiSearch: { apiKey: "gemini-key" },
-        dependencies: {
-          createClient: (() => asOpenAi(create)) as OpenAiCompatibleClientFactory,
-          discoverModel: unknownModelDiscovery,
-          prepareWebSearch,
-          now: () => fixedNow,
-        },
-      }),
-    );
+      }))
+        chunks.push(chunk);
+    })(),
+  ).rejects.toMatchObject({ name: "ResearchUnavailableError" });
+  expect(chunks.some((chunk) => chunk.type === "tool")).toBe(true);
+  expect(
+    chunks.some((chunk) => chunk.type === "delta" || chunk.type === "done"),
+  ).toBe(false);
+});
 
-    expect(chunks).toEqual([
-      { type: "delta", text: "Live " },
-      { type: "delta", text: "answer" },
+it("strict research accepts fresh page text and preserves tool history", async () => {
+  mocks.readUrl.mockResolvedValue({
+    title: "Fresh page",
+    url: "https://source.test/new",
+    content: "Fresh source text",
+    truncated: false,
+    provider: "jina",
+  });
+  const model = sequencedModel([
+    toolStep(0, "read_url", { url: "https://source.test/new" }),
+  ]);
+  mocks.responses.mockReturnValue(model);
+  const chunks: ChatReplyStreamChunk[] = [];
+  for await (const chunk of generateReplyStream(messages, {
+    ...baseOptions,
+    researchMode: "always",
+  }))
+    chunks.push(chunk);
+  expect(model.doStreamCalls[0]?.toolChoice).toEqual({ type: "required" });
+  expect(model.doStreamCalls[1]?.toolChoice).toEqual({ type: "auto" });
+  expect(chunks.map((chunk) => chunk.type)).toEqual([
+    "tool",
+    "tool",
+    "delta",
+    "done",
+  ]);
+  const done = chunks.at(-1);
+  if (done?.type !== "done") throw new Error("missing done");
+  expect(done.reply.readSources).toEqual([1]);
+  expect(
+    done.reply.agentMessages?.some((message) => message.role === "tool"),
+  ).toBe(true);
+});
+
+it("strict research cannot be satisfied by a retained source catalog", async () => {
+  mocks.responses.mockReturnValue(scriptedModel());
+  await expect(
+    generateReply(
+      [
+        { role: "user", content: "Earlier question" },
+        {
+          role: "assistant",
+          content: "Earlier answer [1]",
+          webSources: [{ title: "Old", url: "https://old.test/" }],
+        },
+        { role: "user", content: "Check it again" },
+      ],
+      { ...baseOptions, researchMode: "always" },
+    ),
+  ).rejects.toMatchObject({ name: "ResearchUnavailableError" });
+});
+
+it("keeps prior source numbers stable when another page is read", async () => {
+  mocks.readUrl.mockResolvedValue({
+    title: "New",
+    url: "https://new.test/",
+    content: "Evidence",
+    provider: "jina",
+    truncated: false,
+  });
+  mocks.responses.mockReturnValue(
+    sequencedModel([toolStep(0, "read_url", { url: "https://new.test/" })]),
+  );
+  const reply = await generateReply(
+    [
       {
-        type: "done",
-        reply: {
-          message: "Live answer",
-          provider: "primary-openai-compatible",
-          model: "primary/model",
-          webSearch: searchMetadata,
-        },
+        role: "assistant",
+        content: "Old answer [1]",
+        webSources: [{ title: "Old", url: "https://old.test/" }],
       },
-    ]);
-    expect(prepareWebSearch).toHaveBeenCalledOnce();
-    expect(create.mock.calls[0]?.[0]).toMatchObject({
-      stream: true,
-      max_output_tokens: 4_096,
+      ...messages,
+    ],
+    baseOptions,
+  );
+  expect(reply.webSearch?.sources.map((source) => source.title)).toEqual([
+    "Old",
+    "New",
+  ]);
+  expect(reply.readSources).toEqual([2]);
+});
+
+it.each(["unavailable", "unknown"] as const)(
+  "does not expose images when discovery is %s",
+  async (availability) => {
+    const model = scriptedModel();
+    mocks.responses.mockReturnValue(model);
+    await generateReply(messages, {
+      ...baseOptions,
+      imageGeneration: { enabled: true, model: "gpt-image-2" },
+      dependencies: {
+        discoverModel: async (config) =>
+          config.model === "gpt-image-2" ? availability : "available",
+      },
     });
-    expect(create.mock.calls[0]?.[0]).not.toHaveProperty("tools");
+    expect(
+      model.doStreamCalls[0]?.tools?.map((tool) => tool.name),
+    ).not.toContain("generate_image");
+  },
+);
+
+it("skips a primary text model only when discovery definitely excludes it", async () => {
+  mocks.responses.mockReturnValue(scriptedModel());
+  const reply = await generateReply(messages, {
+    ...baseOptions,
+    dependencies: { discoverModel: async () => "unavailable" },
   });
+  expect(mocks.responses.mock.calls.map((call) => call[0])).toEqual([
+    "fallback",
+  ]);
+  expect(reply.provider).toBe("openrouter");
+});
 
-  it("reuses one search result across ordered streaming OpenRouter fallback", async () => {
-    const primaryCreate = vi
-      .fn()
-      .mockRejectedValue(new Error("primary unavailable"));
-    const createClient = (() =>
-      asOpenAi(primaryCreate)) as OpenAiCompatibleClientFactory;
-    const prepareWebSearch = searchPreparer();
-    const requestedModels: string[] = [];
-    const fetchMock = vi.fn<FetchImplementation>(async (_input, init) => {
-      const body = JSON.parse(String(init?.body)) as {
-        model: string;
-        input: ChatMessage[];
-      };
-      requestedModels.push(body.model);
-      expect(body.input.at(-1)?.content).toContain(
-        "BEGIN_APPLICATION_WEB_RESEARCH_JSON",
-      );
-
-      if (body.model === "fallback/one") {
-        return new Response('{"error":{"message":"temporarily unavailable"}}', {
-          status: 503,
-        });
-      }
-
-      return new Response(
-        [
-          'data: {"type":"response.output_text.delta","delta":"Fallback "}\r\n\r\n',
-          'data: {"type":"response.output_text.delta","delta":"answer"}\r\n\r\n',
-          'data: {"type":"response.output_text.done","text":"Fallback answer"}\r\n\r\n',
-          "data: [DONE]\r\n\r\n",
-        ].join(""),
-        { status: 200, headers: { "Content-Type": "text/event-stream" } },
-      );
-    });
-
-    const chunks = await collectStream(
-      generateChatReplyStream(originalMessages, {
-        providerConfig: fullProviderConfig,
-        researchMode: "always",
-        geminiSearch: { apiKey: "gemini-key" },
-        dependencies: {
-          createClient,
-          discoverModel: unknownModelDiscovery,
-          fetch: fetchMock,
-          prepareWebSearch,
-          now: () => fixedNow,
-          logger: { warn: vi.fn() },
-        },
+it("does not log raw SDK stream errors", async () => {
+  const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+  mocks.responses.mockReturnValue(
+    new MockLanguageModelV4({
+      doStream: async () => ({
+        stream: simulateReadableStream({
+          initialDelayInMs: null,
+          chunkDelayInMs: null,
+          chunks: [
+            {
+              type: "error",
+              error: new Error("private upstream body with secret prompt"),
+            },
+          ],
+        }),
       }),
-    );
-
-    expect(requestedModels).toEqual(["fallback/one", "fallback/two"]);
-    expect(prepareWebSearch).toHaveBeenCalledOnce();
-    expect(chunks.slice(0, 2)).toEqual([
-      { type: "delta", text: "Fallback " },
-      { type: "delta", text: "answer" },
-    ]);
-    expect(chunks.at(-1)).toEqual({
-      type: "done",
-      reply: {
-        message: "Fallback answer",
-        provider: "openrouter",
-        model: "fallback/two",
-        webSearch: searchMetadata,
-      },
-    });
-  });
-
-  it("never restarts on fallback after a visible primary delta", async () => {
-    async function* failingStream() {
-      yield { type: "response.output_text.delta", delta: "Visible" };
-      throw new Error("connection reset");
-    }
-
-    const fetchMock = vi.fn<FetchImplementation>();
-    const seen: ChatReplyStreamChunk[] = [];
-
-    await expect(
-      (async () => {
-        for await (const chunk of generateChatReplyStream(originalMessages, {
-          providerConfig: fullProviderConfig,
-          enableWebSearch: false,
-          dependencies: {
-            createClient: (() =>
-              asOpenAi(
-                vi.fn().mockResolvedValue(failingStream()),
-              )) as OpenAiCompatibleClientFactory,
-            discoverModel: unknownModelDiscovery,
-            fetch: fetchMock,
-            logger: { warn: vi.fn() },
-          },
-        })) {
-          seen.push(chunk);
-        }
-      })(),
-    ).rejects.toThrow(/failed after response started/i);
-
-    expect(seen).toEqual([{ type: "delta", text: "Visible" }]);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("rejects a primary stream that reaches clean EOF after an unterminated delta", async () => {
-    async function* truncatedStream() {
-      yield { type: "response.output_text.delta", delta: "Partial" };
-    }
-
-    const fetchMock = vi.fn<FetchImplementation>();
-    const seen: ChatReplyStreamChunk[] = [];
-
-    await expect(
-      (async () => {
-        for await (const chunk of generateChatReplyStream(originalMessages, {
-          providerConfig: fullProviderConfig,
-          enableWebSearch: false,
-          dependencies: {
-            createClient: (() =>
-              asOpenAi(
-                vi.fn().mockResolvedValue(truncatedStream()),
-              )) as OpenAiCompatibleClientFactory,
-            discoverModel: unknownModelDiscovery,
-            fetch: fetchMock,
-            logger: { warn: vi.fn() },
-          },
-        })) {
-          seen.push(chunk);
-        }
-      })(),
-    ).rejects.toThrow(/failed after response started/i);
-
-    expect(seen).toEqual([{ type: "delta", text: "Partial" }]);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("never tries a later OpenRouter model after a visible fallback delta", async () => {
-    const openRouterOnly: ProviderConfig = {
-      openRouter: fullProviderConfig.openRouter,
-      publicServiceUrl: fullProviderConfig.publicServiceUrl,
-      appName: fullProviderConfig.appName,
-    };
-    const requestedModels: string[] = [];
-    const fetchMock = vi.fn<FetchImplementation>(async (_input, init) => {
-      const body = JSON.parse(String(init?.body)) as { model: string };
-      requestedModels.push(body.model);
-      return new Response(
-        [
-          'data: {"type":"response.output_text.delta","delta":"Visible"}\n\n',
-          'data: {"type":"error","message":"stream disconnected"}\n\n',
-        ].join(""),
-        {
-        status: 200,
-        headers: { "Content-Type": "text/event-stream" },
-        },
-      );
-    });
-    const seen: ChatReplyStreamChunk[] = [];
-
-    await expect(
-      (async () => {
-        for await (const chunk of generateChatReplyStream(originalMessages, {
-          providerConfig: openRouterOnly,
-          enableWebSearch: false,
-          dependencies: {
-            fetch: fetchMock,
-            logger: { warn: vi.fn() },
-          },
-        })) {
-          seen.push(chunk);
-        }
-      })(),
-    ).rejects.toThrow(/failed after response started/i);
-
-    expect(seen).toEqual([{ type: "delta", text: "Visible" }]);
-    expect(requestedModels).toEqual(["fallback/one"]);
-  });
-
-  it("rejects raw OpenRouter clean EOF after a delta without a terminal marker", async () => {
-    const openRouterOnly: ProviderConfig = {
-      openRouter: fullProviderConfig.openRouter,
-      publicServiceUrl: fullProviderConfig.publicServiceUrl,
-      appName: fullProviderConfig.appName,
-    };
-    const requestedModels: string[] = [];
-    const fetchMock = vi.fn<FetchImplementation>(async (_input, init) => {
-      const body = JSON.parse(String(init?.body)) as { model: string };
-      requestedModels.push(body.model);
-      return new Response(
-        'data: {"type":"response.output_text.delta","delta":"Partial"}\n\n',
-        {
-          status: 200,
-          headers: { "Content-Type": "text/event-stream" },
-        },
-      );
-    });
-    const seen: ChatReplyStreamChunk[] = [];
-
-    await expect(
-      (async () => {
-        for await (const chunk of generateChatReplyStream(originalMessages, {
-          providerConfig: openRouterOnly,
-          enableWebSearch: false,
-          dependencies: {
-            fetch: fetchMock,
-            logger: { warn: vi.fn() },
-          },
-        })) {
-          seen.push(chunk);
-        }
-      })(),
-    ).rejects.toThrow(/failed after response started/i);
-
-    expect(seen).toEqual([{ type: "delta", text: "Partial" }]);
-    expect(requestedModels).toEqual(["fallback/one"]);
-  });
+    }),
+  );
+  await expect(generateReply(messages, baseOptions)).rejects.toThrow(
+    /private upstream/,
+  );
+  expect(errorLog).not.toHaveBeenCalled();
 });

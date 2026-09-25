@@ -1,117 +1,92 @@
 # SignLoop Chat Service
 
-A standalone, stateless, text-only HTTP extraction of SignLoop's chat-generation pipeline. It exposes a small public chat API, performs Gemini-grounded Google research only when requested or clearly needed, and generates a response through a server-configured OpenAI-compatible provider with ordered OpenRouter fallback.
+A standalone, stateless HTTP service running SignLoop's agentic chat engine on Bun and Render. The answering model can search, read web pages and PDFs, fetch public API data, and optionally generate images across multiple model steps. Callers retain their own conversation history.
 
-This repository contains no UI, Clerk integration, database, saved threads, uploads, or model selector. The service does not store conversations: callers must send the complete conversation history with every request.
+The engine is ported from SignLoop commit `3f830abaae4d47dedecabea3fca57a4899a8f688`. See [SOURCE_PROVENANCE.md](./SOURCE_PROVENANCE.md) for the copied modules and standalone adaptations.
 
 ## Architecture
 
 ```text
-client
+client sends text + optional tool history/source catalog
   -> Bun.serve HTTP boundary
-  -> per-process concurrency gate
-  -> bounded JSON reader + conversation validation
-  -> authoritative UTC time
-  -> zero or one Gemini-grounded Google research pass (request policy)
-  -> primary OpenAI-compatible model
-       -> configured OpenRouter fallbacks in order, when eligible
-  -> missing source-link attachment
-  -> JSON response or newline-delimited JSON stream
+  -> per-process concurrency gate + bounded request validation
+  -> authoritative UTC time + server-controlled provider selection
+  -> SignLoop ToolLoopAgent (at most 10 model steps)
+       -> search_web: Brave / Firecrawl / Gemini search leads
+       -> read_url: Firecrawl / Jina page or PDF text
+       -> http_get: direct public HTTP(S) API data
+       -> generate_image: optional primary image endpoint
+       -> completed tool results returned to the answering model
+       -> next-step provider fallback when needed
+  -> citation normalization + bounded replay state
+  -> JSON or NDJSON response
 ```
 
-The service has two routes:
-
-- `GET /healthz` is a process-liveness check. It does not contact Gemini or a generation provider.
-- `POST /v1/chat` is the public chat endpoint. It supports non-streaming JSON and streaming NDJSON responses.
-
-The model and provider URLs are controlled only by server configuration. Clients cannot select an arbitrary model or provider.
-
-## Source provenance
-
-The pipeline was extracted from the immutable SignLoop revision below, rather than from a moving checkout:
-
-- Repository: [omertekin2002/SignLoop](https://github.com/omertekin2002/SignLoop)
-- Branch: `main`
-- Commit: `5d06ed2630386c4a9af78373ce998d31dbc1f776`
-- Pinned tree: [SignLoop at `5d06ed2`](https://github.com/omertekin2002/SignLoop/tree/5d06ed2630386c4a9af78373ce998d31dbc1f776)
-- Local source checkout used during extraction: `/Users/omertekin/Desktop/Grind/SignLoop`
-
-See [SOURCE_PROVENANCE.md](./SOURCE_PROVENANCE.md) for the source-to-destination file map and the intentionally excluded application code. No credentials, local environment files, generated files, database configuration, or SignLoop worktree changes were copied.
+There is no database, Clerk integration, saved-thread API, contract datastore, upload handling, or persistent disk requirement. Private contract tools, chat naming, and SignLoop's UI remain in SignLoop. Optional generated images are returned inline; the service does not store them. Langfuse tracing is not enabled in this service.
 
 ## Local setup
 
-Bun is pinned to **1.3.11** in `package.json` and the Render Blueprint. Install that exact version with your preferred Bun version manager, then verify it before installing dependencies:
+Bun is pinned to **1.3.11** in `package.json` and `render.yaml`.
 
 ```sh
 bun --version
-# 1.3.11
-
 bun install --frozen-lockfile
 cp .env.example .env
-```
-
-Edit `.env` and provide at least one generation path. A primary path requires both `PRIMARY_LLM_BASE_URL` and `PRIMARY_LLM_API_KEY`; alternatively, set `OPENROUTER_API_KEY`, or configure both for fallback. `GEMINI_API_KEY` is optional for generic chat but is required for successful grounded research.
-
-Run the static checks and unit tests, then start the service:
-
-```sh
 bun run check-types
 bun run test
 bun run dev
 ```
 
-`bun run dev` watches source files. Use `bun run start` for the non-watching production command. By default the server listens on `0.0.0.0:10000`.
+Configure a complete primary provider URL/key pair, an OpenRouter key, or both. Provider endpoints must support **streaming Responses API function calls and tool-result continuation**. This is also required for non-streaming HTTP clients: the service collects the same internal streaming agent loop into a JSON reply.
 
-After Bun has parsed a request's headers, the listener disables its shorter per-request idle timeout because grounded research can legitimately be quiet before the first response byte. Bun's header-phase transport guard remains active, while the abort-aware `REQUEST_TIMEOUT_MS` limit is authoritative for request bodies and provider work.
+Use `bun run start` in production. The listener binds to `0.0.0.0:10000` by default. `/healthz` checks process liveness without calling providers.
 
 ## Configuration
 
-Configuration is validated once when the process starts. Secret values belong in the runtime environment and must never be committed.
+Configuration is validated once at startup. Provider URLs, credentials, models, and image availability are controlled by the server; callers cannot override them.
 
-| Variable | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `GEMINI_API_KEY` | No | — | Enables Gemini-grounded Google research. `research: "always"` returns `research_unavailable` when it is absent. |
-| `GEMINI_SEARCH_MODEL` | No | `gemini-2.5-flash` | Gemini model used for grounded research. |
-| `PRIMARY_LLM_BASE_URL` | Conditional | — | HTTP(S) base URL of the primary OpenAI-compatible Responses API. Must be set together with `PRIMARY_LLM_API_KEY`. |
-| `PRIMARY_LLM_API_KEY` | Conditional | — | Primary-provider credential. Must be set together with `PRIMARY_LLM_BASE_URL`. |
-| `PRIMARY_LLM_MODEL` | Strongly recommended with a primary | `gpt-5.6-luna` | Server-controlled model. It must be supported by the configured `PRIMARY_LLM_BASE_URL`, not merely by OpenAI generally. A safe startup warning is emitted when this legacy default is used. |
-| `OPENROUTER_API_KEY` | Conditional | — | Enables OpenRouter generation and fallback. Required if the primary path is absent. |
-| `OPENROUTER_BASE_URL` | No | `https://openrouter.ai/api/v1` | OpenRouter-compatible HTTP(S) base URL. |
-| `OPENROUTER_FALLBACK_MODELS` | No | `openrouter/free` | Comma-separated ordered model IDs. Values are trimmed, deduplicated, and limited to five; empty IDs are rejected. |
-| `PUBLIC_SERVICE_URL` | No | `RENDER_EXTERNAL_URL`, then `http://localhost:<PORT>` | Public service identity sent to compatible providers as `HTTP-Referer`. |
-| `RENDER_EXTERNAL_URL` | No | — | Render-provided fallback for `PUBLIC_SERVICE_URL`; it is not normally set by hand. |
-| `APP_NAME` | No | `SignLoop Chat Service` | Service identity sent to compatible providers as `X-Title`. |
-| `PORT` | No | `10000` | Listening port, from `1` through `65535`. Render supplies this in hosted environments. |
-| `MAX_CONCURRENT_REQUESTS` | No | `4` | Maximum active inference requests in this process. Excess requests receive `429`. |
-| `REQUEST_TIMEOUT_MS` | No | `180000` | Request/provider timeout in milliseconds; maximum `3600000`. |
-| `CORS_ALLOWED_ORIGINS` | No | empty (CORS disabled) | Comma-separated explicit HTTP(S) browser origins. Wildcards are rejected. |
-| `BUN_VERSION` | Render only | `1.3.11` in `render.yaml` | Selects the Bun runtime used by Render's build and start commands. |
-| `NODE_ENV` | Render only | `production` in `render.yaml` | Marks the Blueprint service as a production runtime. |
+| Variable                     | Default                                               | Purpose                                                                                                                                                                         |
+| ---------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PRIMARY_LLM_BASE_URL`       | unset                                                 | Primary OpenAI-compatible API base URL, including `/v1` where applicable. Set together with its key.                                                                            |
+| `PRIMARY_LLM_API_KEY`        | unset                                                 | Primary credential.                                                                                                                                                             |
+| `PRIMARY_LLM_MODEL`          | `gpt-5.6-luna`                                        | Existing gateway default retained for compatibility. Set an explicit model advertised by your endpoint that supports Responses tools. Default use emits a safe startup warning. |
+| `OPENROUTER_API_KEY`         | unset                                                 | Enables OpenRouter generation and fallback. Required if primary is absent.                                                                                                      |
+| `OPENROUTER_BASE_URL`        | `https://openrouter.ai/api/v1`                        | OpenRouter-compatible endpoint.                                                                                                                                                 |
+| `OPENROUTER_FALLBACK_MODELS` | `openrouter/free`                                     | Ordered comma-separated model IDs, deduplicated, maximum five.                                                                                                                  |
+| `WEB_SEARCH_PROVIDER`        | automatic                                             | Optional `brave`, `firecrawl`, or `gemini`. Without an override, configured keys are preferred in that order.                                                                   |
+| `BRAVE_SEARCH_API_KEY`       | unset                                                 | Enables Brave search.                                                                                                                                                           |
+| `FIRECRAWL_API_KEY`          | unset                                                 | Enables Firecrawl search and page/PDF reading.                                                                                                                                  |
+| `GEMINI_API_KEY`             | unset                                                 | Enables Google-grounded Gemini search.                                                                                                                                          |
+| `GEMINI_SEARCH_MODEL`        | `gemini-2.5-flash`                                    | Independent of the answering model.                                                                                                                                             |
+| `JINA_API_KEY`               | unset                                                 | Optional credential for Jina Reader. The reader is also used without a key.                                                                                                     |
+| `ENABLE_IMAGE_GENERATION`    | `false`                                               | Opt-in image tool. Requires primary configuration and positive model discovery.                                                                                                 |
+| `IMAGE_GENERATION_MODEL`     | `gpt-image-2`                                         | Primary image model; must be advertised by `/models`.                                                                                                                           |
+| `PUBLIC_SERVICE_URL`         | `RENDER_EXTERNAL_URL`, then `http://localhost:<PORT>` | Public service identity in provider headers.                                                                                                                                    |
+| `APP_NAME`                   | `SignLoop Chat Service`                               | Provider `X-Title` identity.                                                                                                                                                    |
+| `PORT`                       | `10000`                                               | Listening port, 1–65535. Render supplies this.                                                                                                                                  |
+| `MAX_CONCURRENT_REQUESTS`    | `4`                                                   | Active requests per process. Excess requests receive `429`.                                                                                                                     |
+| `REQUEST_TIMEOUT_MS`         | `275000`                                              | Whole-request deadline, including body reading and provider discovery; maximum 3600000. Agent generation has its own 260-second ceiling.                                        |
+| `CORS_ALLOWED_ORIGINS`       | empty                                                 | Explicit comma-separated HTTP(S) browser origins. Wildcards are rejected.                                                                                                       |
+| `BUN_VERSION`                | `1.3.11` in Blueprint                                 | Render runtime pin.                                                                                                                                                             |
+| `NODE_ENV`                   | `production` in Blueprint                             | Render environment.                                                                                                                                                             |
 
-At least one generation path must be valid at startup. If both paths are configured, the primary is attempted first and OpenRouter is used only as described under [Research and provider fallback](#research-and-provider-fallback).
+An explicit search provider selects one integration; it is not a retry chain between search providers. Search failure becomes a tool error so the model can refine its query or explain the limitation. Page reading prefers Firecrawl and can fall back to Jina within a shared deadline. `http_get` needs no search key.
 
-## Public access
+Image generation is disabled unless explicitly enabled and discovery confirms the configured image model. An unavailable discovery endpoint does not expose the image tool. Images use the primary endpoint even when text generation has fallen back to OpenRouter.
 
-`POST /v1/chat` does not require an API key. Send only the JSON content type:
+## Public API
 
-```http
-Content-Type: application/json
-```
+- `GET /healthz` → `{"ok":true,"service":"signloop-chat-service"}`
+- `POST /v1/chat` → JSON or NDJSON chat response.
 
-Provider credentials and provider base URLs remain server-controlled and are never returned to clients. Because every caller can initiate paid provider work, deploy behind an external rate limiter or access-control layer if the endpoint is exposed to untrusted traffic.
-
-CORS is a browser interoperability control, not access control. Non-browser clients can call the endpoint regardless of the configured origin allowlist.
-
-## Chat request
-
-Every request supplies the complete conversation history:
+The chat route remains public, with no API key required. Send `Content-Type: application/json`.
 
 ```json
 {
   "messages": [
     {
       "role": "user",
-      "content": "Explain indemnification clauses."
+      "content": "Find and read sources about the latest changes."
     }
   ],
   "stream": false,
@@ -119,230 +94,155 @@ Every request supplies the complete conversation history:
 }
 ```
 
-Request rules:
+`messages` must be a non-empty array of `user` and `assistant` messages, ending in a user message. Each requires non-empty string `content`. Client system messages and model/provider selection are rejected. `stream` defaults to `true`; `research` defaults to `auto`.
 
-- `messages` is required and must be a non-empty array.
-- Only `user` and `assistant` roles are accepted. Client-supplied `system` messages are rejected.
-- The final message must have the `user` role.
-- `stream` is optional and defaults to `true`.
-- `research` is optional and defaults to `auto`. Accepted values are `auto`, `always`, and `never`.
-- A client-controlled model or provider URL is not supported.
+### Research modes
 
-Research modes:
+- **`auto`** exposes `search_web`, `read_url`, and `http_get`. The answering model decides whether to use them, including on follow-up questions and non-English prompts. There is no keyword classifier or mandatory preprocessing search.
+- **`always`** requires non-empty source text fetched successfully during this turn through `read_url` or a successful `http_get`. Search snippets and retained history do not satisfy the requirement. Tool use is required until evidence is obtained. If the completed run has no fresh evidence, the service returns `research_unavailable`. Tool progress streams immediately, but answer deltas are buffered until the run succeeds.
+- **`never`** disables all three external research tools. Previously supplied history remains available. Optional image generation is controlled separately by server configuration.
 
-- `auto` searches only for explicit web/source requests, current-time language, or clearly volatile subjects such as weather, prices, schedules, scores, current office holders, and recent law changes. If research is unavailable or ungrounded, generation continues without injected research.
-- `always` requires valid grounded text and sources. Research failure returns a safe `502` instead of an ungrounded answer.
-- `never` skips Gemini for the turn.
+The strict check establishes that fresh evidence was retrieved. It does not establish that every claim in the answer is supported.
 
-### Non-streaming example
-
-```sh
-curl --fail-with-body --silent --show-error \
-  --request POST "http://localhost:10000/v1/chat" \
-  --header "Content-Type: application/json" \
-  --data '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "Explain indemnification clauses."
-      }
-    ],
-    "stream": false,
-    "research": "auto"
-  }'
-```
-
-Successful response:
+### JSON response
 
 ```json
 {
-  "message": "The complete assistant response, with any missing source links attached.",
+  "message": "Answer [1]\n\nSources:\n- [1] [Source title](<https://example.com/page>)",
   "provider": "primary-openai-compatible",
   "model": "configured-model",
   "webSearch": {
-    "query": "query used by Gemini",
-    "attemptedQueries": ["query used by Gemini"],
+    "query": "model-selected query",
+    "attemptedQueries": ["model-selected query"],
     "successfulSearches": 1,
-    "sources": [{"title":"Source title","url":"https://example.com/","snippet":"Optional supported claim"}]
+    "sources": [{ "title": "Source title", "url": "https://example.com/page" }]
   },
-  "webSearchQuery": "query used by Gemini",
-  "webSearchAttempts": ["query used by Gemini"],
+  "webSearchQuery": "model-selected query",
+  "webSearchAttempts": ["model-selected query"],
   "webSearchSuccessfulCount": 1,
   "webSources": [
+    { "title": "Source title", "url": "https://example.com/page" }
+  ],
+  "toolActivity": [
     {
-      "title": "Source title",
-      "url": "https://example.com/",
-      "snippet": "Optional supported claim"
+      "id": "call-1",
+      "tool": "read_url",
+      "query": "https://example.com/page",
+      "status": "complete"
     }
-  ]
+  ],
+  "readSources": [1],
+  "figures": "ok"
 }
 ```
 
-`provider` is either `primary-openai-compatible` or `openrouter`; `model` reports the server-selected model that completed the request. When a turn is not researched, `webSearch` and `webSearchQuery` are `null`, the attempts and sources arrays are empty, and the successful count is zero.
+`provider` is `primary-openai-compatible` or `openrouter`. It identifies the last selected text provider; different completed steps can use different providers after fallback. `agentMessages`, when present, contains the SDK assistant/tool exchanges for future turns. These are bounded and can be omitted when there is no useful tool replay.
 
-### Streaming example
+`webSources` is a cumulative source catalog with stable one-based indices. `readSources` identifies sources fetched during the current turn. The footer lists fetched sources and valid references to earlier sources, preserving their original numbers. Search leads do not enter the catalog until fetched. A direct page/API read can produce sources with no search query. If no catalog exists, `webSearch`/`webSearchQuery` are null and legacy search arrays/counts are empty/zero; `toolActivity` still records searches that produced only unread leads.
 
-Use `--no-buffer` so `curl` prints each event as it arrives:
+`figures` is `ok`, `no-evidence`, or `unmatched`. SignLoop's heuristic checks measured numbers against text fetched during this turn and may append a notice. It is not semantic fact checking and does not validate earlier-turn evidence.
 
-```sh
-curl --no-buffer --fail-with-body --silent --show-error \
-  --request POST "http://localhost:10000/v1/chat" \
-  --header "Content-Type: application/json" \
-  --data '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "What changed recently in EU AI regulation?"
-      }
-    ],
-    "stream": true
-  }'
+### Stateful conversations over a stateless service
+
+For each successful reply, retain `message`, `agentMessages`, and `webSources`. On the next request, send the tool state and source catalog on that assistant message:
+
+```js
+history.push({
+  role: "assistant",
+  content: reply.message,
+  ...(reply.agentMessages ? { agentMessages: reply.agentMessages } : {}),
+  webSources: reply.webSources,
+});
+history.push({ role: "user", content: "Explain that source in more detail." });
 ```
 
-The response content type is `application/x-ndjson; charset=utf-8`. Each event is one JSON object followed by exactly one newline:
+Bound the history before sending it. Compact inline generated-image data to a text placeholder before truncating assistant content to 4000 characters. Retain only the newest cumulative source catalog and trim oldest complete user/assistant pairs to satisfy both character and UTF-8 request-byte limits. The updated otekin client implements this.
+
+Malformed or oversized replay/catalog fields are dropped. Replay accepts only SDK assistant/tool text and tool exchanges, never system/user instruction roles, media, or approval parts. This prevents SDK media downloads outside the public HTTP tool's guards. Client-supplied replay is conversation context, not trusted proof of research. Legacy text-only clients continue to work but cannot retain full tool evidence between turns.
+
+### Streaming response
+
+The content type is `application/x-ndjson; charset=utf-8`. Each line is one JSON object:
 
 ```json
-{"type":"delta","text":"Partial text"}
-{"type":"delta","text":" continues."}
-{"type":"done","message":"Partial text continues.\n\nSources:\n1. [Source title](<https://example.com/>)","provider":"primary-openai-compatible","model":"configured-model","webSearch":{"query":"query used by Gemini","attemptedQueries":["query used by Gemini"],"successfulSearches":1,"sources":[{"title":"Source title","url":"https://example.com/","snippet":"Optional supported claim"}]},"webSearchQuery":"query used by Gemini","webSearchAttempts":["query used by Gemini"],"webSearchSuccessfulCount":1,"webSources":[{"title":"Source title","url":"https://example.com/","snippet":"Optional supported claim"}]}
+{"type":"tool","activity":{"id":"call-1","tool":"read_url","query":"https://example.com/page","status":"running"}}
+{"type":"tool","activity":{"id":"call-1","tool":"read_url","query":"https://example.com/page","status":"complete"}}
+{"type":"delta","text":"Answer [1]"}
+{"type":"done","message":"Answer [1]\n\nSources:\n- [1] [Source](<https://example.com/page>)","provider":"primary-openai-compatible","model":"configured-model"}
 ```
 
-If a failure occurs after the stream is open, the terminal event is safe and contains no upstream details:
+The `done` event carries the same metadata as the JSON response. Tool statuses are `running`, `complete`, or `error`. Clients should tolerate new event types. Treat **`done.message` as the canonical answer**: citation normalization, source footers, and figure notices happen after generation. A connected stream ends with one `done` or `error` event. Disconnects cancel provider/tool work.
 
-```json
-{"type":"error","error":"Chat request failed. Please try again.","code":"generation_unavailable"}
-```
-
-**Treat the terminal `done.message` as the canonical complete answer.** Do not persist or display only the concatenated `delta.text` values: source links can be attached after model token streaming has finished and therefore may appear only in `done.message`. Every stream terminates with either `done` or `error`.
-
-## Health check
-
-```sh
-curl --fail --silent --show-error http://localhost:10000/healthz
-```
+Errors after the stream opens retain HTTP 200 and appear as a terminal event:
 
 ```json
 {
-  "ok": true,
-  "service": "signloop-chat-service"
+  "type": "error",
+  "error": "Chat request failed. Please try again.",
+  "code": "generation_unavailable"
 }
 ```
 
-The health check is intentionally unauthenticated and does not probe upstream providers. A Gemini or LLM outage therefore does not make the process-liveness endpoint fail.
+### Provider fallback and limits
 
-## Research and provider fallback
+Primary model discovery remains advisory for text generation: a valid model list that excludes the configured model skips primary; unknown availability still attempts it. Definite results are cached for five minutes. All discovery and generation share the request deadline.
 
-For each accepted chat request, the service:
+The agent uses SignLoop's 20-second stream-opening guard per candidate. Metadata-only streams do not satisfy it. A failed opening can move to the next configured provider; an already-opened step is never replayed. Completed tool results survive a provider switch on a later step. SDK automatic retries are disabled. Incomplete output, token-limit finishes, and EOF without full completion are rejected.
 
-1. Adds authoritative current UTC context without imposing an identity, tone, or behavioral persona.
-2. Resolves the `research` policy. `auto` uses a pure, deterministic classifier over only the latest user message; it does not make another LLM call.
-3. Runs at most one Gemini-grounded Google research pass. Valid grounded evidence is bounded and added to the latest user message with prompt-injection defenses.
-4. In `auto`, discards the entire failed or invalid research result and continues with the original prepared messages. In `always`, returns `research_unavailable` instead.
-5. Checks `<PRIMARY_LLM_BASE_URL>/models` with a short bounded request. A valid list that excludes the configured model skips primary; an unsupported or failing discovery endpoint remains advisory and primary is still attempted. Definite results are cached for five minutes.
-6. Attempts the configured primary model, when present, then the models from `OPENROUTER_FALLBACK_MODELS` in order. The default is only `openrouter/free`.
-7. Attaches any missing grounded source links to the canonical final answer.
+| Limit                                                      |                                            Value |
+| ---------------------------------------------------------- | -----------------------------------------------: |
+| Messages per request                                       |                                               30 |
+| Characters per message                                     |                                             4000 |
+| Total history, including serialized replay/source metadata |                                 60000 characters |
+| HTTP request body                                          |                  128 KiB, incrementally enforced |
+| Model steps                                                |                    10; final step disables tools |
+| Output tokens                                              |                              4096 per model step |
+| Search executions                                          |                      3 distinct queries per turn |
+| Page reads / direct HTTP fetches                           |        5 each per turn; repeated URLs are cached |
+| Page / API text                                            |                      12000 characters per result |
+| Tool replay                                                | 20000 serialized characters, at most 36 messages |
+| Source catalog                                             |         64 entries / 16000 serialized characters |
+| Image generations                                          |                          2 per turn when enabled |
+| Image payload                                              |                        8 MiB of base64 per image |
 
-Research happens at most once, outside the provider fallback loop, and the same valid result is reused verbatim for every generation attempt. Provider discovery and all generation attempts share the request deadline; cancellation or timeout aborts the chain immediately.
+Public HTTP fetching validates each redirect and resolved socket address, blocks private/reserved IPs and credential-bearing URLs, and bounds response size. Requests to hosted readers also validate the requested URL. Retrieved text is marked as untrusted data.
 
-For streaming requests, fallback is allowed only before visible response content has been emitted. After the first `delta`, the service never restarts the answer on another provider; a later failure produces a terminal `error` event instead. This prevents a single response from silently mixing output from multiple models.
+### Errors and request IDs
 
-## Limits and abuse protection
+| Status                | Stable code              | Meaning                                                |
+| --------------------- | ------------------------ | ------------------------------------------------------ |
+| 400 / 404 / 413 / 415 | `invalid_request`        | Invalid input, route, size, or content type.           |
+| 429                   | `service_busy`           | Per-process capacity exhausted; inspect `Retry-After`. |
+| 502                   | `research_unavailable`   | Strict research did not obtain fresh evidence.         |
+| 502                   | `generation_unavailable` | Provider exhaustion or incomplete/failed generation.   |
+| 504                   | `request_timeout`        | Request or generation deadline expired.                |
+| 500                   | `generation_unavailable` | Unexpected boundary failure.                           |
 
-| Limit | Value |
-| --- | ---: |
-| Messages per request | 30 |
-| Characters per message | 4,000 |
-| Total message characters | 60,000 |
-| HTTP request body | 128 KiB |
-| Generated output tokens | 4,096 |
+Responses carry `X-Request-ID`; safe incoming IDs are propagated. Structured logs retain request timing, counts, and allowlisted provider failure metadata. They omit prompts, research bodies, credentials, provider URLs, raw upstream error messages, and stack traces. SDK default error/warning logging is suppressed.
 
-The body is read incrementally, so chunked transfer encoding cannot bypass the 128 KiB limit. Oversized bodies or histories receive `413`.
+The concurrency gate applies per process. CORS is browser interoperability, not access control. For shared quotas or access restrictions, use an external gateway/rate limiter. Every caller can initiate provider work, including image generation if enabled.
 
-The concurrency gate is an in-memory semaphore and therefore applies **per process instance**, not globally. Horizontal scaling multiplies the effective capacity. Before accepting untrusted third-party traffic or enforcing account quotas across instances, put quota/rate enforcement in a shared datastore or API gateway. The service itself intentionally has no datastore.
+## Deployment and validation
 
-CORS is disabled by default. When `CORS_ALLOWED_ORIGINS` is set, only those exact origins are allowed; a wildcard is not accepted. CORS does not protect the public endpoint from non-browser clients.
-
-## Errors and request IDs
-
-Errors returned before a stream opens use a safe JSON message, stable `code`, and an appropriate HTTP status. Streaming requests establish the NDJSON response before grounded research and generation finish, so later failures are represented by a terminal `error` event containing the same safe code while the already-sent HTTP status remains `200`.
-
-| Status | Meaning |
-| ---: | --- |
-| `400` | Malformed JSON, invalid request fields or roles, empty messages, or a non-user final message. |
-| `404` | Unknown route. |
-| `413` | Request body, message, message count, or history limit exceeded. |
-| `415` | Request content type is not `application/json`. |
-| `429` | This process has reached `MAX_CONCURRENT_REQUESTS`; inspect `Retry-After` before retrying. |
-| `502` | Required Gemini research or all eligible generation providers failed; inspect the stable error code. |
-| `504` | Service-level timeout. |
-| `500` | Unexpected internal failure. |
-
-Stable error codes:
-
-| Code | Meaning |
-| --- | --- |
-| `invalid_request` | The route, content type, JSON, messages, request size, or request-controlled options are invalid. |
-| `research_unavailable` | `research: "always"` could not obtain complete grounded research. |
-| `generation_unavailable` | All eligible generation providers failed, or an open stream could not complete safely. |
-| `request_timeout` | The service-level request deadline expired. |
-| `service_busy` | The per-process concurrency limit is full; inspect `Retry-After`. |
-
-An incoming `X-Request-ID` is propagated when safe; otherwise the service generates one. Every JSON response and NDJSON response carries `X-Request-ID`. The response request ID can be used to correlate structured logs. Provider-failure logs allowlist only provider, model, error class, numeric status, short machine-readable provider code, and safe upstream request ID. Public errors and logs do not include authorization headers, API keys, prompts, research briefs, source snippets, full upstream bodies, provider base URLs, upstream messages, or stack traces.
-
-## Privacy and data handling
-
-The service itself is stateless. It has no database or persistent disk requirement and does not save conversations, messages, threads, user settings, or research results. Request data exists in process memory only for the work needed to serve the request, and callers remain responsible for sending complete history on the next turn.
-
-Stateless does not mean that request content stays on the host:
-
-- Conversation content is transmitted to Gemini only when the resolved research policy enables grounded Google research.
-- The prepared request is transmitted to the selected primary or OpenRouter generation provider. It includes bounded research evidence only after Gemini returns usable grounded text and valid sources.
-- Provider retention, logging, regional processing, and training policies are outside this service's control. Review the policies and account settings of every configured provider before sending sensitive or regulated information.
-
-## Deploy with the Render Blueprint
-
-[`render.yaml`](./render.yaml) defines a Bun web service named `signloop-chat-api`. It pins `BUN_VERSION=1.3.11`, runs dependency installation, type checking, and tests during the build, starts with `bun run start`, and uses `/healthz` as the HTTP health-check path.
-
-To deploy it as a [Render Blueprint](https://render.com/docs/infrastructure-as-code):
-
-1. Push this repository to a Git host and create a new Blueprint in Render from that repository.
-2. Review the service generated from `render.yaml`.
-3. Before changing Render configuration, query the configured primary endpoint's `/models` resource with its existing credential and choose an advertised model. Do not copy the provider URL, response body, or credential into logs or tickets.
-4. Enter secret values for the `sync: false` variables in Render. Set `PRIMARY_LLM_MODEL` to the supported model, keep `OPENROUTER_FALLBACK_MODELS=openrouter/free`, and configure a complete primary provider pair, `OPENROUTER_API_KEY`, or both. Set `GEMINI_API_KEY` when grounded research should be available. Do not commit or replace existing secret values without explicit authorization.
-5. Apply the Blueprint and let Render run the declared build and start commands.
-6. Use the assigned external URL for the smoke requests below. Render supplies `PORT`, and the server binds to `0.0.0.0`.
-
-No Render Postgres database, persistent disk, or other storage resource is needed. If configuration changes outside the Blueprint, keep the required and conditional relationships from the environment table intact. See Render's documentation for [environment variables](https://render.com/docs/configure-environment-variables), [web-service port binding](https://render.com/docs/web-services), and [health checks](https://render.com/docs/health-checks).
-
-These are deployment instructions only; this repository does not assert that a Render deployment or live-provider validation has already been completed.
-
-## `curl` smoke check
-
-With a local server running—or after substituting a deployed base URL—set values in the shell and check liveness plus both response modes:
+[render.yaml](./render.yaml) installs the locked dependencies, type-checks, runs tests, starts Bun, and checks `/healthz`. No database or persistent disk is needed. Add integration credentials through Render environment settings. Set `PRIMARY_LLM_MODEL` to a compatible model supported by your endpoint. Existing deployments explicitly configured with `REQUEST_TIMEOUT_MS=180000` retain that shorter deadline until updated.
 
 ```sh
-export CHAT_SERVICE_URL="http://localhost:10000"
-
-curl --fail --silent --show-error \
-  "$CHAT_SERVICE_URL/healthz"
-
+curl --fail http://localhost:10000/healthz
 curl --fail-with-body --silent --show-error \
-  --request POST "$CHAT_SERVICE_URL/v1/chat" \
-  --header "Content-Type: application/json" \
-  --data '{"messages":[{"role":"user","content":"Hello"}],"stream":false}'
-
-curl --no-buffer --fail-with-body --silent --show-error \
-  --request POST "$CHAT_SERVICE_URL/v1/chat" \
-  --header "Content-Type: application/json" \
-  --data '{"messages":[{"role":"user","content":"Reply with exactly: diagnostic ok."}],"stream":true}'
+  http://localhost:10000/v1/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":false}'
+curl --no-buffer http://localhost:10000/v1/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Read https://example.com and summarize it"}],"research":"always"}'
 ```
 
-After deployment, also exercise the research contract with a current-information question in default `auto` mode, repeat it with `"research":"never"`, and send an ungroundable prompt with `"research":"always"`. Expected outcomes are: casual prompts return `200` with `webSearch: null`; the current question is grounded in `auto`; the `never` request has no sources; and failed strict grounding returns a safe `502` with `code: "research_unavailable"`. Correlate each response's `X-Request-ID` with Render logs and confirm casual prompts did not invoke Gemini, stale fallback model IDs were not attempted, `openrouter/free` remains available, and no prompt or secret content appears.
-
-The chat checks call live external providers and can incur provider usage or cost. They are not part of the normal unit-test suite.
-
-An equivalent automated live smoke test is explicitly opt-in and is skipped by a normal `bun run test` invocation:
+The normal suite uses mocked providers, including real SDK Responses serialization and HTTP-boundary tests. A live provider smoke test is opt-in and incurs provider usage:
 
 ```sh
 RUN_LIVE_TESTS=1 bun run test -- tests/live.test.ts
 ```
+
+Local tests do not establish deployed provider compatibility. Before rollout, check a simple reply, a search/read/answer cycle, a follow-up with replay, strict research failure, cancellation, and an optional image request against the configured deployment.
+
+Conversation content goes to the selected generation providers. Search queries go to the selected search integration; URLs and page content are processed through readers or public HTTP targets. Optional image prompts go to the primary image provider. The gateway itself retains no conversations after requests; provider retention is separate. The updated otekin client retains chat state in memory and writes requested generated images to temporary local PNG files.

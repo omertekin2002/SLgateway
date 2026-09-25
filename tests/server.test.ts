@@ -15,9 +15,7 @@ import { DEFAULT_CHAT_ERROR_MESSAGE } from "../src/prompts";
 
 const TEST_URL = "http://service.test";
 
-function makeConfig(
-  overrides: Partial<ServiceConfig> = {},
-): ServiceConfig {
+function makeConfig(overrides: Partial<ServiceConfig> = {}): ServiceConfig {
   return {
     geminiApiKey: "gemini-secret-never-return",
     geminiSearchModel: "gemini-test-model",
@@ -28,6 +26,9 @@ function makeConfig(
       modelWasDefaulted: false,
     },
     openRouter: null,
+    webTools: {},
+    imageGenerationEnabled: false,
+    imageGenerationModel: "gpt-image-2",
     publicServiceUrl: TEST_URL,
     appName: "SignLoop test service",
     port: 10_000,
@@ -67,13 +68,12 @@ type ChatRequestOptions = {
   signal?: AbortSignal;
 };
 
-function chatRequest(
-  body: unknown,
-  options: ChatRequestOptions = {},
-): Request {
+function chatRequest(body: unknown, options: ChatRequestOptions = {}): Request {
   const headers = new Headers(options.headers);
   const contentType =
-    options.contentType === undefined ? "application/json" : options.contentType;
+    options.contentType === undefined
+      ? "application/json"
+      : options.contentType;
 
   if (contentType !== null) headers.set("Content-Type", contentType);
 
@@ -252,10 +252,14 @@ describe("HTTP request parsing and policy", () => {
           encoder.encode('{"messages":[{"role":"user","content":"'),
         );
         controller.enqueue(
-          encoder.encode("x".repeat(Math.floor(MAX_CHAT_REQUEST_BODY_BYTES / 2))),
+          encoder.encode(
+            "x".repeat(Math.floor(MAX_CHAT_REQUEST_BODY_BYTES / 2)),
+          ),
         );
         controller.enqueue(
-          encoder.encode("x".repeat(Math.floor(MAX_CHAT_REQUEST_BODY_BYTES / 2))),
+          encoder.encode(
+            "x".repeat(Math.floor(MAX_CHAT_REQUEST_BODY_BYTES / 2)),
+          ),
         );
         controller.enqueue(encoder.encode('x"}]}'));
         controller.close();
@@ -440,7 +444,9 @@ describe("HTTP request parsing and policy", () => {
     );
 
     expect(response.status).toBe(400);
-    expect(response.headers.get("X-Request-ID")).toBe("invalid-research-request");
+    expect(response.headers.get("X-Request-ID")).toBe(
+      "invalid-research-request",
+    );
     await expect(response.json()).resolves.toEqual({
       error: "research must be one of: auto, always, never.",
       code: "invalid_request",
@@ -539,6 +545,7 @@ describe("HTTP response contracts", () => {
         "Answer with an existing [first citation](<https://one.example.test/source>).",
       provider: "openrouter",
       model: "fallback-model",
+      readSources: [2],
       webSearch: {
         query: "indemnity clause law",
         attemptedQueries: ["indemnity clause", "indemnity clause law"],
@@ -572,7 +579,7 @@ describe("HTTP response contracts", () => {
     );
     await expect(response.json()).resolves.toEqual({
       message:
-        "Answer with an existing [first citation](<https://one.example.test/source>).\n\nSources:\n2. [Second source](<https://two.example.test/source>)",
+        "Answer with an existing [first citation](<https://one.example.test/source>).\n\nSources:\n- [2] [Second source](<https://two.example.test/source>)",
       provider: "openrouter",
       model: "fallback-model",
       webSearch: reply.webSearch,
@@ -580,12 +587,15 @@ describe("HTTP response contracts", () => {
       webSearchAttempts: ["indemnity clause", "indemnity clause law"],
       webSearchSuccessfulCount: 1,
       webSources: reply.webSearch?.sources,
+      readSources: reply.readSources,
+      toolActivity: [],
     });
   });
 
   it("defaults to streaming and emits valid NDJSON with one exact terminal event", async () => {
     const reply = makeReply({
       message: "Complete canonical answer",
+      readSources: [1],
       webSearch: {
         query: "current contract rule",
         attemptedQueries: ["current contract rule"],
@@ -635,7 +645,7 @@ describe("HTTP response contracts", () => {
       {
         type: "done",
         message:
-          "Complete canonical answer\n\nSources:\n1. [Authoritative source](<https://source.example.test/rule>)",
+          "Complete canonical answer\n\nSources:\n- [1] [Authoritative source](<https://source.example.test/rule>)",
         provider: "primary-openai-compatible",
         model: "server-controlled-model",
         webSearch: reply.webSearch,
@@ -643,12 +653,12 @@ describe("HTTP response contracts", () => {
         webSearchAttempts: ["current contract rule"],
         webSearchSuccessfulCount: 1,
         webSources: reply.webSearch?.sources,
+        readSources: reply.readSources,
+        toolActivity: [],
       },
     ]);
     expect(
-      events.filter(
-        (event) => event.type === "done" || event.type === "error",
-      ),
+      events.filter((event) => event.type === "done" || event.type === "error"),
     ).toHaveLength(1);
     expect(events.at(-1)?.type).toBe("done");
     expect(text.split("\n")).toHaveLength(events.length + 1);
@@ -811,7 +821,9 @@ describe("timeouts, cancellation, and concurrency", () => {
       }),
     );
     expect(semaphore.active).toBe(1);
-    requestController.abort(new DOMException("client disconnected", "AbortError"));
+    requestController.abort(
+      new DOMException("client disconnected", "AbortError"),
+    );
     const response = await responsePromise;
 
     expect(response.status).toBe(400);
@@ -898,11 +910,13 @@ describe("timeouts, cancellation, and concurrency", () => {
     const lateReply = new Promise<ChatReply>((resolve) => {
       resolveReply = resolve;
     });
-    const generate = vi.fn<ChatPipeline["generate"]>(async (_messages, options) => {
-      signal = options.signal;
-      markStarted();
-      return lateReply;
-    });
+    const generate = vi.fn<ChatPipeline["generate"]>(
+      async (_messages, options) => {
+        signal = options.signal;
+        markStarted();
+        return lateReply;
+      },
+    );
     const semaphore = new InferenceSemaphore(1);
     const handler = createRequestHandler({
       config: makeConfig({ requestTimeoutMs: 25 }),
@@ -943,15 +957,14 @@ describe("timeouts, cancellation, and concurrency", () => {
     const chunkGate = new Promise<void>((resolve) => {
       releaseChunk = resolve;
     });
-    const stream = vi.fn<ChatPipeline["stream"]>(async function* (
-      _messages,
-      options,
-    ) {
-      signal = options.signal;
-      markStarted();
-      await chunkGate;
-      yield { type: "done", reply: makeReply({ message: "Too late" }) };
-    });
+    const stream = vi.fn<ChatPipeline["stream"]>(
+      async function* (_messages, options) {
+        signal = options.signal;
+        markStarted();
+        await chunkGate;
+        yield { type: "done", reply: makeReply({ message: "Too late" }) };
+      },
+    );
     const semaphore = new InferenceSemaphore(1);
     const handler = createRequestHandler({
       config: makeConfig({ requestTimeoutMs: 25 }),
@@ -1086,7 +1099,9 @@ describe("timeouts, cancellation, and concurrency", () => {
     );
     await started;
     expect(semaphore.active).toBe(1);
-    requestController.abort(new DOMException("client disconnected", "AbortError"));
+    requestController.abort(
+      new DOMException("client disconnected", "AbortError"),
+    );
     const response = await responsePromise;
 
     expect(pipelineSignal?.aborted).toBe(true);
@@ -1237,7 +1252,9 @@ describe("CORS and request IDs", () => {
     expect(propagated.headers.get("X-Request-ID")).toBe("client-id:123");
     expect(generated.headers.get("X-Request-ID")).toBe("generated-request-id");
     expect(requestIdFactory).toHaveBeenCalledOnce();
-    expect(log.mock.calls[0]?.[0]).toMatchObject({ requestId: "client-id:123" });
+    expect(log.mock.calls[0]?.[0]).toMatchObject({
+      requestId: "client-id:123",
+    });
     expect(log.mock.calls[1]?.[0]).toMatchObject({
       requestId: "generated-request-id",
     });

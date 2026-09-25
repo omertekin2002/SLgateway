@@ -1,12 +1,10 @@
 import { isRecord } from "../utils";
+import { readBoundedJson } from "./bounded-response";
 
 export const PRIMARY_MODEL_DISCOVERY_TIMEOUT_MS = 7_500;
 export const PRIMARY_MODEL_DISCOVERY_CACHE_TTL_MS = 5 * 60_000;
 
-export type PrimaryModelAvailability =
-  | "available"
-  | "unavailable"
-  | "unknown";
+export type PrimaryModelAvailability = "available" | "unavailable" | "unknown";
 
 export type PrimaryModelDiscoveryConfig = Readonly<{
   baseURL: string;
@@ -36,8 +34,7 @@ const availabilityCache = new Map<string, CachedAvailability>();
 
 function abortReason(signal: AbortSignal): unknown {
   return (
-    signal.reason ??
-    new DOMException("The operation was aborted", "AbortError")
+    signal.reason ?? new DOMException("The operation was aborted", "AbortError")
   );
 }
 
@@ -77,7 +74,9 @@ export async function discoverPrimaryModelAvailability(
   options.signal?.addEventListener("abort", onAbort, { once: true });
   const timeout = setTimeout(() => {
     discoveryTimedOut = true;
-    controller.abort(new DOMException("Model discovery timed out", "TimeoutError"));
+    controller.abort(
+      new DOMException("Model discovery timed out", "TimeoutError"),
+    );
   }, options.timeoutMs ?? PRIMARY_MODEL_DISCOVERY_TIMEOUT_MS);
 
   try {
@@ -96,7 +95,7 @@ export async function discoverPrimaryModelAvailability(
     );
     if (!response.ok) return "unknown";
 
-    const ids = modelIds(await response.json());
+    const ids = modelIds(await readBoundedJson(response, controller.signal));
     if (!ids) return "unknown";
     const availability = ids.includes(config.model)
       ? "available"
@@ -104,8 +103,7 @@ export async function discoverPrimaryModelAvailability(
     availabilityCache.set(cacheKey, {
       availability,
       expiresAt:
-        now +
-        (options.cacheTtlMs ?? PRIMARY_MODEL_DISCOVERY_CACHE_TTL_MS),
+        now + (options.cacheTtlMs ?? PRIMARY_MODEL_DISCOVERY_CACHE_TTL_MS),
     });
     return availability;
   } catch (error) {

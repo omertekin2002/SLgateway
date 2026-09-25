@@ -21,7 +21,11 @@ services:
       - key: MAX_CONCURRENT_REQUESTS
         value: 4
       - key: REQUEST_TIMEOUT_MS
-        value: 180000
+        value: 275000
+      - key: ENABLE_IMAGE_GENERATION
+        value: "false"
+      - key: IMAGE_GENERATION_MODEL
+        value: gpt-image-2
       - key: GEMINI_API_KEY
         sync: false
       - key: PRIMARY_LLM_BASE_URL

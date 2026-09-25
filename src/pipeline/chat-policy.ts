@@ -1,13 +1,50 @@
-// Adapted from SignLoop apps/web/lib/chat-policy.ts.
-// Source commit: 5d06ed2630386c4a9af78373ce998d31dbc1f776
-
+// Ported from SignLoop apps/web/lib/chat-policy.ts at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+import type { ModelMessage } from "ai";
 import type { ChatMessage, ChatRole } from "./chat";
 import { isRecord } from "../utils";
+import {
+  isPlainAssistantReplay,
+  parseAgentMessages,
+  parseWebSources,
+} from "./chat-agent-history";
+import { withAbort } from "./bounded-response";
+export { MAX_AGENT_STATE_CHARACTERS } from "./chat-agent-history";
 
 export const MAX_CHAT_MESSAGES = 30;
 export const MAX_CHAT_MESSAGE_LENGTH = 4_000;
 export const MAX_CHAT_TOTAL_MESSAGE_LENGTH = 60_000;
 export const MAX_CHAT_REQUEST_BODY_BYTES = 128 * 1024;
+/**
+ * Replay arrives from the caller. Keep SignLoop's structural validation, then restrict it to
+ * text and tool exchanges: this gateway emits no media or approvals in model transcripts.
+ * SDK file parts can trigger automatic downloads outside the public HTTP tool's guards.
+ * Drop an unsupported transcript whole so its canonical text remains usable.
+ */
+export function parseClientAgentMessages(
+  value: unknown,
+): ModelMessage[] | undefined {
+  const messages = parseAgentMessages(value);
+  if (!messages) return undefined;
+  for (const message of messages) {
+    if (typeof message.content === "string") continue;
+    for (const part of message.content) {
+      if (part.type === "tool-result") {
+        if (
+          part.output.type === "content" &&
+          part.output.value.some((item) => item.type !== "text")
+        )
+          return undefined;
+      } else if (
+        part.type !== "text" &&
+        part.type !== "reasoning" &&
+        part.type !== "tool-call"
+      ) {
+        return undefined;
+      }
+    }
+  }
+  return messages;
+}
 
 /** Replace generated image payloads before a message is sent back to a text model. */
 export function compactInlineImageDataUris(text: string): string {
@@ -32,8 +69,7 @@ export type ParsedChatMessages =
   | { ok: false; error: string; status: number };
 
 export type ParsedJsonRequest<T> =
-  | { ok: true; value: T }
-  | { ok: false; error: string; status: number };
+  { ok: true; value: T } | { ok: false; error: string; status: number };
 
 function isClientChatRole(
   value: unknown,
@@ -105,7 +141,26 @@ export function parseClientChatMessages(payload: unknown): ParsedChatMessages {
       };
     }
 
-    normalized.push({ role, content: trimmed });
+    const agentMessages =
+      role === "assistant"
+        ? parseClientAgentMessages(item.agentMessages)
+        : undefined;
+    const webSources =
+      role === "assistant" ? parseWebSources(item.webSources) : undefined;
+    totalLength += JSON.stringify({ agentMessages, webSources }).length;
+    if (totalLength > MAX_CHAT_TOTAL_MESSAGE_LENGTH) {
+      return {
+        ok: false,
+        status: 413,
+        error: "Chat history is too large. Start a new chat.",
+      };
+    }
+    normalized.push({
+      role,
+      content: trimmed,
+      ...(agentMessages ? { agentMessages } : {}),
+      ...(webSources ? { webSources } : {}),
+    });
   }
 
   if (!normalized.length) {
@@ -131,22 +186,11 @@ export function parseClientChatMessages(payload: unknown): ParsedChatMessages {
 export async function parseBoundedJsonRequest<T>(
   request: Request,
   maxBytes = MAX_CHAT_REQUEST_BODY_BYTES,
-  signal?: AbortSignal,
+  signal: AbortSignal = request.signal,
 ): Promise<ParsedJsonRequest<T>> {
   const reader = request.body?.getReader();
   if (!reader) {
     return { ok: false, error: "Invalid JSON body", status: 400 };
-  }
-
-  const cancelReader = () => {
-    // Cancelling the locked reader resolves a pending read even when the client never closes its
-    // upload stream. Do not await the underlying source's cancellation hook on the abort path.
-    void reader.cancel(signal?.reason).catch(() => {});
-  };
-  if (signal?.aborted) {
-    cancelReader();
-  } else {
-    signal?.addEventListener("abort", cancelReader, { once: true });
   }
 
   const chunks: Uint8Array[] = [];
@@ -154,14 +198,12 @@ export async function parseBoundedJsonRequest<T>(
 
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await withAbort(reader.read(), signal);
       if (done) break;
       if (!value) continue;
 
       totalBytes += value.byteLength;
       if (totalBytes > maxBytes) {
-        // The size decision is final; do not let a slow underlying cancellation hook retain the
-        // request's concurrency slot.
         void reader.cancel().catch(() => {});
         return {
           ok: false,
@@ -172,16 +214,12 @@ export async function parseBoundedJsonRequest<T>(
       chunks.push(value);
     }
   } catch {
-    if (signal?.aborted) {
-      return { ok: false, error: "Request was aborted.", status: 400 };
-    }
-    return { ok: false, error: "Invalid JSON body", status: 400 };
+    void reader.cancel(signal.reason).catch(() => {});
+    return signal.aborted
+      ? { ok: false, error: "Request was aborted.", status: 400 }
+      : { ok: false, error: "Invalid JSON body", status: 400 };
   } finally {
-    signal?.removeEventListener("abort", cancelReader);
-  }
-
-  if (signal?.aborted) {
-    return { ok: false, error: "Request was aborted.", status: 400 };
+    reader.releaseLock();
   }
 
   const bytes = new Uint8Array(totalBytes);
@@ -201,7 +239,55 @@ export async function parseBoundedJsonRequest<T>(
   }
 }
 
-/** Keep the newest canonical messages inside the per-message and total character budgets. */
+/** Saved chats trust only the new user turn; earlier history is reconstructed from the database. */
+export function parseLatestClientUserMessage(
+  payload: unknown,
+): ParsedChatMessages {
+  if (!isRecord(payload)) {
+    return { ok: false, error: "Request body must be an object.", status: 400 };
+  }
+
+  const rawMessages = (payload as RequestPayload).messages;
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
+    return { ok: false, error: "Chat requires a user message.", status: 400 };
+  }
+  if (rawMessages.length > MAX_CHAT_MESSAGES) {
+    return {
+      ok: false,
+      error: `Chat supports at most ${MAX_CHAT_MESSAGES} messages per request.`,
+      status: 413,
+    };
+  }
+
+  const latest = rawMessages.at(-1);
+  if (
+    !isRecord(latest) ||
+    latest.role !== "user" ||
+    typeof latest.content !== "string"
+  ) {
+    return {
+      ok: false,
+      error: "The final chat message must be from the user.",
+      status: 400,
+    };
+  }
+  if (latest.content.length > MAX_CHAT_MESSAGE_LENGTH) {
+    return {
+      ok: false,
+      error: `Each message must be at most ${MAX_CHAT_MESSAGE_LENGTH} characters.`,
+      status: 413,
+    };
+  }
+
+  const content = latest.content.trim();
+  if (!content) {
+    return { ok: false, error: "Messages cannot be empty.", status: 400 };
+  }
+
+  return { ok: true, messages: [{ role: "user", content }] };
+}
+
+/** Keep the newest canonical messages inside the same per-message and total character budgets. */
 export function boundCanonicalChatHistory(
   messages: readonly ChatMessage[],
   reservedCharacters = 0,
@@ -211,12 +297,13 @@ export function boundCanonicalChatHistory(
     MAX_CHAT_TOTAL_MESSAGE_LENGTH - Math.max(0, Math.trunc(reservedCharacters)),
   );
   const selected: ChatMessage[] = [];
+  let includedSources = false;
 
   for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (selected.length >= MAX_CHAT_MESSAGES) break;
     const message = messages[index];
-    if (!message || (message.role !== "user" && message.role !== "assistant")) {
+    if (!message || (message.role !== "user" && message.role !== "assistant"))
       continue;
-    }
 
     const content = compactInlineImageDataUris(message.content.trim()).slice(
       0,
@@ -225,9 +312,64 @@ export function boundCanonicalChatHistory(
     if (!content) continue;
     if (content.length > remainingCharacters) break;
 
-    selected.push({ role: message.role, content });
-    remainingCharacters -= content.length;
+    // Catalogs accumulate across turns. Only the newest retained copy is read by generation.
+    const sourceSize =
+      !includedSources && message.webSources?.length
+        ? JSON.stringify({ webSources: message.webSources }).length
+        : 0;
+    const includeSources =
+      sourceSize > 0 && sourceSize + content.length <= remainingCharacters;
+    const agentMessages =
+      message.agentMessages?.length &&
+      !isPlainAssistantReplay(message.agentMessages)
+        ? message.agentMessages
+        : undefined;
+    const agentStateSize = JSON.stringify({ agentMessages }).length;
+    const includeAgentState =
+      message.role === "assistant" &&
+      agentMessages?.length &&
+      agentStateSize + content.length + (includeSources ? sourceSize : 0) <=
+        remainingCharacters;
+    selected.push({
+      role: message.role,
+      content,
+      ...(includeAgentState
+        ? {
+            agentMessages,
+          }
+        : {}),
+      ...(includeSources ? { webSources: message.webSources } : {}),
+    });
+    if (includeSources) includedSources = true;
+    remainingCharacters -=
+      content.length +
+      (includeAgentState ? agentStateSize : 0) +
+      (includeSources ? sourceSize : 0);
   }
 
   return selected.reverse();
+}
+
+/** Bound history for transport; the runtime retains the full text for display. */
+export function boundTemporaryChatHistory(
+  messages: readonly ChatMessage[],
+): ChatMessage[] {
+  const latest = messages.at(-1);
+  if (!latest) return [];
+  // Never silently truncate the user's new request; server validation gives a useful error.
+  const history = boundCanonicalChatHistory(
+    messages.slice(-MAX_CHAT_MESSAGES, -1),
+    latest.content.length,
+  );
+  const encoder = new TextEncoder();
+  const result = [...history, latest];
+  // Reserve framing space for thread/mode fields and account for Unicode and JSON escaping.
+  while (
+    result.length > 1 &&
+    encoder.encode(JSON.stringify({ messages: result })).byteLength >
+      MAX_CHAT_REQUEST_BODY_BYTES - 2048
+  ) {
+    result.shift();
+  }
+  return result;
 }

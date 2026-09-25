@@ -11,9 +11,7 @@ import {
 // Source commit: 5d06ed2630386c4a9af78373ce998d31dbc1f776
 // Environment reads were replaced with explicit configuration and injectable clients.
 
-export const OPENROUTER_MODELS = [
-  "openrouter/free",
-] as const;
+export const OPENROUTER_MODELS = ["openrouter/free"] as const;
 
 export type LlmProvider = "primary-openai-compatible" | "openrouter";
 
@@ -78,7 +76,7 @@ const SILENT_OPENAI_SDK_LOGGER = Object.freeze({
   debug: () => {},
 });
 
-function createRestrictedProviderFetch(input: {
+export function createRestrictedProviderFetch(input: {
   fetch: FetchImplementation;
   apiKey: string;
   publicServiceUrl?: string;
@@ -285,7 +283,7 @@ export function createOpenAiCompatibleClient(
     webhookSecret: null,
     baseURL: resolvedBaseUrl,
     timeout: options?.timeoutMs ?? 60_000,
-    maxRetries: 1,
+    maxRetries: 0,
     logLevel: "off",
     logger: SILENT_OPENAI_SDK_LOGGER,
     defaultHeaders,
@@ -358,8 +356,7 @@ function isAbortError(error: unknown, signal?: AbortSignal): boolean {
 
 function abortReason(signal: AbortSignal): unknown {
   return (
-    signal.reason ??
-    new DOMException("The operation was aborted", "AbortError")
+    signal.reason ?? new DOMException("The operation was aborted", "AbortError")
   );
 }
 
@@ -463,10 +460,13 @@ export async function runWithPrimaryAndOpenRouterFallback<T>(
           providerCode: "model_not_available",
         };
         failures.push(failure);
-        logger.warn("Configured primary model is not advertised by the provider", {
-          event: "provider_model_unavailable",
-          ...failure,
-        });
+        logger.warn(
+          "Configured primary model is not advertised by the provider",
+          {
+            event: "provider_model_unavailable",
+            ...failure,
+          },
+        );
       } else {
         try {
           const primaryClient = createClient(

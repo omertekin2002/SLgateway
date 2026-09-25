@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  OPENROUTER_FALLBACK_MODELS,
-  loadServiceConfig,
-} from "../src/config";
+import { OPENROUTER_FALLBACK_MODELS, loadServiceConfig } from "../src/config";
 
 const minimumEnvironment = {
   GEMINI_API_KEY: "gemini-secret",
@@ -15,7 +12,7 @@ describe("loadServiceConfig", () => {
 
     expect(config.port).toBe(10_000);
     expect(config.maxConcurrentRequests).toBe(4);
-    expect(config.requestTimeoutMs).toBe(180_000);
+    expect(config.requestTimeoutMs).toBe(275_000);
     expect(config.geminiSearchModel).toBe("gemini-2.5-flash");
     expect(config.openRouter?.models).toEqual(OPENROUTER_FALLBACK_MODELS);
     expect(config.publicServiceUrl).toBe("http://localhost:10000");
@@ -64,8 +61,7 @@ describe("loadServiceConfig", () => {
   it("parses ordered OpenRouter models, removes duplicates, and rejects empty IDs", () => {
     const config = loadServiceConfig({
       ...minimumEnvironment,
-      OPENROUTER_FALLBACK_MODELS:
-        "vendor/first, openrouter/free, vendor/first",
+      OPENROUTER_FALLBACK_MODELS: "vendor/first, openrouter/free, vendor/first",
     });
 
     expect(config.openRouter?.models).toEqual([
@@ -149,4 +145,52 @@ describe("loadServiceConfig", () => {
       }).geminiSearchModel,
     ).toBe("gemini-2.5-flash");
   });
+});
+
+it("validates explicit web integrations and opt-in images", () => {
+  const config = loadServiceConfig({
+    ...minimumEnvironment,
+    PRIMARY_LLM_BASE_URL: "https://primary.test/v1",
+    PRIMARY_LLM_API_KEY: "primary",
+    WEB_SEARCH_PROVIDER: "brave",
+    BRAVE_SEARCH_API_KEY: "brave",
+    FIRECRAWL_API_KEY: "firecrawl",
+    JINA_API_KEY: "jina",
+    ENABLE_IMAGE_GENERATION: "true",
+    IMAGE_GENERATION_MODEL: "gpt-image-2",
+  });
+  expect(config.webTools).toMatchObject({
+    provider: "brave",
+    braveApiKey: "brave",
+    firecrawlApiKey: "firecrawl",
+    jinaApiKey: "jina",
+  });
+  expect(config.imageGenerationEnabled).toBe(true);
+  expect(loadServiceConfig(minimumEnvironment).imageGenerationEnabled).toBe(
+    false,
+  );
+  expect(() =>
+    loadServiceConfig({
+      ...minimumEnvironment,
+      ENABLE_IMAGE_GENERATION: "yes",
+    }),
+  ).toThrow(/true or false/);
+  expect(() =>
+    loadServiceConfig({
+      ...minimumEnvironment,
+      ENABLE_IMAGE_GENERATION: "true",
+    }),
+  ).toThrow(/primary/);
+  expect(() =>
+    loadServiceConfig({
+      ...minimumEnvironment,
+      WEB_SEARCH_PROVIDER: "unknown",
+    }),
+  ).toThrow(/WEB_SEARCH_PROVIDER/);
+  expect(() =>
+    loadServiceConfig({
+      ...minimumEnvironment,
+      BRAVE_SEARCH_API_KEY: "bad\nkey",
+    }),
+  ).toThrow(/whitespace/);
 });
