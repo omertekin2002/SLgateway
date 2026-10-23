@@ -88,6 +88,49 @@ describe("parseClientChatMessages", () => {
   });
 });
 
+describe("source catalog wire shape", () => {
+  it("keeps stable citation numbers and legacy positional catalogs on assistant turns", () => {
+    const stable = [
+      { number: 7, title: "Seven", url: "https://seven.test/" },
+      { number: 65, title: "New", url: "https://new.test/" },
+    ];
+    const legacy = [{ title: "Legacy", url: "https://legacy.test/" }];
+    const parsed = parseClientChatMessages({
+      messages: [
+        { role: "assistant", content: "Old [1]", webSources: legacy },
+        { role: "assistant", content: "New [65]", webSources: stable },
+        { role: "user", content: "Continue" },
+      ],
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.messages[0]?.webSources).toEqual(legacy);
+    expect(parsed.messages[1]?.webSources).toEqual(stable);
+  });
+
+  it("drops a catalog with ambiguous citation numbers but keeps the message", () => {
+    const parsed = parseClientChatMessages({
+      messages: [
+        {
+          role: "assistant",
+          content: "Answer [2]",
+          webSources: [
+            { number: 2, title: "One", url: "https://one.test/" },
+            { title: "Two", url: "https://two.test/" },
+          ],
+        },
+        { role: "user", content: "Continue" },
+      ],
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.messages[0]).toEqual({
+      role: "assistant",
+      content: "Answer [2]",
+    });
+  });
+});
+
 describe("text-only history compaction", () => {
   it("removes inline image payloads before rebuilding text-model history", () => {
     const imageMessage = `![Generated image](data:image/png;base64,${"A".repeat(5_000)})`;

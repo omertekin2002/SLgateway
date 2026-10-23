@@ -1,4 +1,4 @@
-// Ported from SignLoop at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+// Ported from SignLoop at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MockLanguageModelV4 } from "ai/test";
 import {
@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   responses: vi.fn(),
   gemini: vi.fn(),
   readUrl: vi.fn(),
+  httpGet: vi.fn(),
   generateImage: vi.fn(),
 }));
 vi.mock("@ai-sdk/openai", () => ({
@@ -23,6 +24,7 @@ vi.mock("@ai-sdk/google", () => ({
 }));
 vi.mock("../src/pipeline/web-search", () => ({ searchWeb: mocks.search }));
 vi.mock("../src/pipeline/url-reader", () => ({ readUrl: mocks.readUrl }));
+vi.mock("../src/pipeline/http-fetch", () => ({ httpGet: mocks.httpGet }));
 vi.mock("../src/pipeline/image-generation", () => ({
   generateImageReply: mocks.generateImage,
 }));
@@ -35,6 +37,7 @@ import {
   type ChatMessage,
 } from "../src/pipeline/chat";
 import {
+  compactAgentMessages,
   MAX_SOURCE_CATALOG_CHARACTERS,
   MAX_SOURCE_COUNT,
 } from "../src/pipeline/chat-agent-history";
@@ -189,6 +192,70 @@ describe("agentic chat", () => {
     ]);
   });
 
+  it.each([false, true])(
+    "keeps the full canonical answer after tool replay (legacy=%s)",
+    async (legacy) => {
+      const answer = `${"x".repeat(2500)} The renewal deadline is September 30.`;
+      const transcript = [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Old clipped commentary" },
+            {
+              type: "tool-call",
+              toolCallId: "c1",
+              toolName: "read_url",
+              input: { url: "https://law.test" },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "c1",
+              toolName: "read_url",
+              output: { type: "text", value: "Source evidence" },
+            },
+          ],
+        },
+        { role: "assistant", content: answer.slice(0, 2000) },
+      ] as const;
+      const replay = compactAgentMessages(transcript);
+      const model = scriptedModel();
+      mocks.responses.mockReturnValue(model);
+      await generateChatReply([
+        { role: "user", content: "Explain the renewal." },
+        {
+          role: "assistant",
+          content: answer,
+          agentMessages: legacy
+            ? JSON.parse(JSON.stringify(transcript))
+            : replay,
+        },
+        { role: "user", content: "What was that deadline?" },
+      ]);
+      const prompt = model.doStreamCalls[0]!.prompt;
+      const serialized = JSON.stringify(prompt);
+      expect(serialized.match(/September 30/g)).toHaveLength(1);
+      expect(serialized).toContain("Source evidence");
+      expect(serialized).not.toContain("Old clipped commentary");
+      expect(prompt.filter((message) => message.role === "tool")).toHaveLength(
+        1,
+      );
+      // Tool exchange first, then the complete canonical answer, then the new question.
+      expect(prompt.slice(-3).map((message) => message.role)).toEqual([
+        "tool",
+        "assistant",
+        "user",
+      ]);
+      expect(prompt.at(-2)?.content).toEqual([
+        { type: "text", text: answer, providerOptions: undefined },
+      ]);
+    },
+  );
+
   it("executes successive model-selected searches and returns results to the model", async () => {
     const model = scriptedModel(["first query", "refined query"]);
     mocks.responses.mockReturnValue(model);
@@ -331,7 +398,7 @@ describe("agentic chat", () => {
     });
     // One source, contributed by the read rather than by the eight-result search.
     expect(reply.webSearch?.sources).toEqual([
-      { title: "Source", url: "https://source.test" },
+      { number: 1, title: "Source", url: "https://source.test" },
     ]);
   });
 
@@ -487,7 +554,7 @@ describe("agentic chat", () => {
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(reply.webSearch?.sources).toEqual([
-      { title: "Statute", url: "https://law.test/statute" },
+      { number: 1, title: "Statute", url: "https://law.test/statute" },
     ]);
     const continuation = JSON.stringify(model.doStreamCalls[1]?.prompt);
     expect(continuation).toContain("UNTRUSTED CONTENT");
@@ -746,18 +813,19 @@ it("keeps prior source numbers stable when another page is read", async () => {
   expect(reply.readSources).toEqual([2]);
 });
 
-it("stops searching and reading new pages once the source catalog is full", async () => {
+it("retires inherited sources to read new evidence after a full inherited catalog", async () => {
+  // A legacy positional catalog: entries carry no explicit numbers.
   const catalog = Array.from({ length: MAX_SOURCE_COUNT }, (_, index) => ({
     title: `Source ${index + 1}`,
     url: `https://s${index + 1}.test/`,
   }));
-  mocks.readUrl.mockResolvedValue({
-    title: "Source 3",
-    url: "https://s3.test/",
-    content: "Evidence",
+  mocks.readUrl.mockImplementation(async (url: string) => ({
+    title: url === "https://s3.test/" ? "Source 3" : "New source",
+    url,
+    content: "Fresh evidence",
     provider: "jina",
     truncated: false,
-  });
+  }));
   const model = sequencedModel([
     toolStep(0, "search_web", { query: "more sources" }),
     toolStep(1, "read_url", { url: "https://new.test/" }),
@@ -767,59 +835,180 @@ it("stops searching and reading new pages once the source catalog is full", asyn
 
   const reply = await generateReply(
     [
-      { role: "assistant", content: "Earlier answer [1]", webSources: catalog },
+      {
+        role: "assistant",
+        content: "Earlier answer [64]",
+        webSources: catalog,
+      },
       ...messages,
     ],
     baseOptions,
   );
 
-  expect(mocks.search).not.toHaveBeenCalled();
-  // A page that already has a number can still be read again as fresh evidence.
+  expect(mocks.search).toHaveBeenCalledOnce();
   expect(mocks.readUrl.mock.calls.map((call) => call[0])).toEqual([
+    "https://new.test/",
     "https://s3.test/",
   ]);
-  expect(JSON.stringify(model.doStreamCalls[3]?.prompt)).toContain(
-    "limit of numbered sources",
+  expect(JSON.stringify(model.doStreamCalls[2]?.prompt)).toContain(
+    "Fresh evidence",
   );
-  expect(reply.readSources).toEqual([3]);
-  expect(reply.webSearch?.sources).toHaveLength(MAX_SOURCE_COUNT);
+  expect(
+    JSON.stringify(model.doStreamCalls).includes("limit of numbered"),
+  ).toBe(false);
+  // The new page takes the next unused number; a re-read keeps its original one.
+  expect(reply.readSources).toEqual([65, 3]);
+  const sources = reply.webSearch!.sources;
+  expect(sources).toHaveLength(MAX_SOURCE_COUNT);
+  expect(sources[0]).toEqual({
+    number: 2,
+    title: "Source 2",
+    url: "https://s2.test/",
+  });
+  expect(sources.at(-1)).toEqual({
+    number: 65,
+    title: "New source",
+    url: "https://new.test/",
+  });
+  expect(sources.some((source) => source.number === 1)).toBe(false);
+  expect(catalog[0]).not.toHaveProperty("number");
 });
 
-it("explains a full catalog when a fetched page's title does not fit", async () => {
-  const newUrl = "https://new.test/";
-  const catalog = Array.from({ length: 50 }, (_, index) => ({
-    title: "t".repeat(240),
+it("strict research can still fetch fresh evidence after a full inherited catalog", async () => {
+  const catalog = Array.from({ length: MAX_SOURCE_COUNT }, (_, index) => ({
+    number: index + 100,
+    title: `Source ${index + 1}`,
     url: `https://s${index + 1}.test/`,
   }));
-  // Leave room for the new address with an empty title, but not for its real title.
-  const spare =
-    MAX_SOURCE_CATALOG_CHARACTERS -
-    JSON.stringify([...catalog, { title: "", url: newUrl }]).length;
-  catalog[0]!.url += "p".repeat(spare - 5);
   mocks.readUrl.mockResolvedValue({
-    title: "A page title longer than the remaining space",
-    url: newUrl,
-    content: "Evidence",
+    title: "Fresh page",
+    url: "https://fresh.test/",
+    content: "Fresh source text",
     provider: "jina",
     truncated: false,
   });
-  const model = sequencedModel([toolStep(0, "read_url", { url: newUrl })]);
+  mocks.responses.mockReturnValue(
+    sequencedModel([toolStep(0, "read_url", { url: "https://fresh.test/" })]),
+  );
+  const chunks: ChatReplyStreamChunk[] = [];
+  for await (const chunk of generateReplyStream(
+    [
+      {
+        role: "assistant",
+        content: "Earlier answer [100]",
+        webSources: catalog,
+      },
+      ...messages,
+    ],
+    { ...baseOptions, researchMode: "always" },
+  ))
+    chunks.push(chunk);
+  const done = chunks.at(-1);
+  if (done?.type !== "done") throw new Error("missing done");
+  // Gapped explicit IDs continue after the highest one.
+  expect(done.reply.readSources).toEqual([164]);
+  expect(done.reply.webSearch?.sources[0]?.number).toBe(101);
+  // Strict mode still releases the answer only after the fresh read succeeded.
+  expect(chunks.filter((chunk) => chunk.type === "delta")).toHaveLength(1);
+});
+
+const bigPage = (host: string, index: number) => ({
+  title: "T".repeat(240),
+  url: `https://${host}.test/${index}/${"x".repeat(1900)}`,
+});
+/** Five page reads and two API reads of near-maximum size: the most this turn can hold. */
+function fillCatalogThisTurn(extra: Array<ReturnType<typeof toolStep>>) {
+  const reads = [0, 1, 2, 3, 4].map((index) => bigPage("read", index));
+  const fetches = [0, 1].map((index) => bigPage("api", index).url);
+  mocks.readUrl.mockImplementation(async (url: string) => ({
+    ...reads.find((page) => page.url === url)!,
+    content: "Fresh evidence",
+    provider: "jina",
+    truncated: false,
+  }));
+  mocks.httpGet.mockImplementation(async (url: string) => ({
+    url,
+    status: 200,
+    contentType: "application/json",
+    truncated: false,
+    body: '{"value":1}',
+  }));
+  return sequencedModel([
+    ...reads.map((page, index) =>
+      toolStep(index, "read_url", { url: page.url }),
+    ),
+    ...fetches.map((url, index) => toolStep(5 + index, "http_get", { url })),
+    ...extra,
+  ]);
+}
+
+it("never evicts this turn's evidence and stops paying for reads it cannot number", async () => {
+  const blocked = bigPage("blocked", 0).url;
+  const model = fillCatalogThisTurn([
+    toolStep(7, "http_get", { url: blocked }),
+  ]);
   mocks.responses.mockReturnValue(model);
 
   const reply = await generateReply(
     [
-      { role: "assistant", content: "Earlier answer [1]", webSources: catalog },
+      {
+        role: "assistant",
+        content: "Earlier answer [1]",
+        webSources: [{ title: "Old", url: "https://old.test/" }],
+      },
       ...messages,
     ],
     baseOptions,
   );
 
-  expect(mocks.readUrl).toHaveBeenCalledOnce();
-  expect(JSON.stringify(model.doStreamCalls[1]?.prompt)).toContain(
+  expect(mocks.readUrl).toHaveBeenCalledTimes(5);
+  expect(mocks.httpGet.mock.calls.map((call) => call[0])).not.toContain(
+    blocked,
+  );
+  expect(JSON.stringify(model.doStreamCalls[8]?.prompt)).toContain(
     "limit of numbered sources",
   );
-  expect(reply.readSources).toEqual([]);
-  expect(reply.webSearch?.sources).toHaveLength(50);
+  expect(reply.readSources).toEqual([2, 3, 4, 5, 6, 7, 8]);
+  const sources = reply.webSearch!.sources;
+  expect(sources.map((source) => source.number)).toEqual(
+    expect.arrayContaining(reply.readSources!),
+  );
+  expect(JSON.stringify(sources).length).toBeLessThanOrEqual(
+    MAX_SOURCE_CATALOG_CHARACTERS,
+  );
+});
+
+it("explains a full catalog when a fetched page's title does not fit", async () => {
+  // Leave room for the new address with an empty title, but not for its real title.
+  const filled = [
+    ...[0, 1, 2, 3, 4].map((index) => bigPage("read", index)),
+    ...[0, 1].map((index) => {
+      const url = bigPage("api", index).url;
+      const target = new URL(url);
+      return {
+        title: `${target.hostname}${target.pathname}`.slice(0, 240),
+        url,
+      };
+    }),
+  ].map((page, index) => ({ ...page, number: index + 1 }));
+  let newUrl = "https://new.test/";
+  const spare =
+    MAX_SOURCE_CATALOG_CHARACTERS -
+    JSON.stringify([...filled, { title: "", url: newUrl, number: 8 }]).length;
+  newUrl += "p".repeat(spare - 5);
+  expect(spare - 5).toBeGreaterThan(0);
+  expect(newUrl.length).toBeLessThanOrEqual(2048);
+  const model = fillCatalogThisTurn([toolStep(7, "http_get", { url: newUrl })]);
+  mocks.responses.mockReturnValue(model);
+
+  const reply = await generateReply(messages, baseOptions);
+
+  expect(mocks.httpGet.mock.calls.at(-1)?.[0]).toBe(newUrl);
+  expect(JSON.stringify(model.doStreamCalls[8]?.prompt)).toContain(
+    "limit of numbered sources",
+  );
+  expect(reply.readSources).toEqual([1, 2, 3, 4, 5, 6, 7]);
+  expect(reply.webSearch?.sources).toEqual(filled);
 });
 
 it.each([

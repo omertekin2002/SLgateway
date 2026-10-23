@@ -1,4 +1,4 @@
-// Ported from SignLoop apps/web/lib/gemini-search.ts at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+// Ported from SignLoop apps/web/lib/gemini-search.ts at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
 import { readBoundedResponse } from "./bounded-response";
 import { getErrorMessage, isRecord } from "../utils";
 import { buildAuthoritativeUtcTimeContext } from "./chat-time";
@@ -22,6 +22,8 @@ Do not address the user or add a standalone sources list; source metadata is han
 `.trim();
 
 export type WebSearchSource = {
+  /** Stable citation ID in chat catalogs; absent on search results and legacy caller catalogs. */
+  number?: number;
   title: string;
   url: string;
   snippet?: string | null;

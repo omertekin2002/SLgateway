@@ -1,30 +1,21 @@
-// Ported from SignLoop apps/web/lib/chat-agent-history.ts at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+// Ported from SignLoop apps/web/lib/chat-agent-history.ts at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
 import { modelMessageSchema, type ModelMessage } from "ai";
 import { z } from "zod";
+import {
+  isPlainAssistantReplay,
+  MAX_AGENT_STATE_CHARACTERS,
+} from "./chat-history-shared";
+
+export {
+  isPlainAssistantReplay,
+  MAX_AGENT_STATE_CHARACTERS,
+  MAX_SOURCE_CATALOG_CHARACTERS,
+  MAX_SOURCE_COUNT,
+  MAX_SOURCE_TITLE_CHARACTERS,
+  parseWebSources,
+} from "./chat-history-shared";
 
 const historySchema = z.array(modelMessageSchema).max(36);
-export const MAX_AGENT_STATE_CHARACTERS = 20_000;
-export const MAX_SOURCE_CATALOG_CHARACTERS = 16_000;
-export const MAX_SOURCE_COUNT = 64;
-export const MAX_SOURCE_TITLE_CHARACTERS = 240;
-// Matches the canonical per-message limit. Replay replaces an assistant message's canonical content,
-// so a shorter clip would hide part of the previous answer whenever tools were used.
-const MAX_REPLAY_ANSWER_CHARACTERS = 4_000;
-
-/** Plain answers already live in canonical message content; replay adds no tool evidence. */
-export function isPlainAssistantReplay(
-  messages: readonly ModelMessage[],
-): boolean {
-  return (
-    messages.length > 0 &&
-    messages.every(
-      (message) =>
-        message.role === "assistant" &&
-        (typeof message.content === "string" ||
-          message.content.every((part) => part.type === "text")),
-    )
-  );
-}
 
 /** Accept only assistant/tool turns supplied by the caller; never replay system instructions from metadata. */
 export function parseAgentMessages(value: unknown): ModelMessage[] | undefined {
@@ -45,28 +36,7 @@ export function parseAgentMessages(value: unknown): ModelMessage[] | undefined {
   return parsed.data;
 }
 
-const sourcesSchema = z
-  .array(
-    z.object({
-      title: z.string().max(MAX_SOURCE_TITLE_CHARACTERS),
-      url: z
-        .string()
-        .max(2048)
-        .url()
-        .refine((value) => /^https?:/.test(value)),
-      snippet: z.string().max(600).nullish(),
-    }),
-  )
-  .max(MAX_SOURCE_COUNT);
-
-export function parseWebSources(value: unknown) {
-  if (JSON.stringify(value ?? null).length > MAX_SOURCE_CATALOG_CHARACTERS)
-    return undefined;
-  const parsed = sourcesSchema.safeParse(value);
-  return parsed.success ? parsed.data : undefined;
-}
-
-/** Keep recent complete assistant/tool exchanges; bound evidence without orphaning tool results. */
+/** Keep tool exchanges; the canonical answer is replayed separately, without clipping it twice. */
 export function compactAgentMessages(
   value: unknown,
 ): ModelMessage[] | undefined {
@@ -82,26 +52,26 @@ export function compactAgentMessages(
     text.length > 2_000
       ? `${text.slice(0, 2_000)}\n[Replay excerpt; read the source again for more detail.]`
       : text;
-  const clipAnswer = (text: string) =>
-    text.length > MAX_REPLAY_ANSWER_CHARACTERS
-      ? `${text.slice(0, MAX_REPLAY_ANSWER_CHARACTERS)}\n[Earlier answer shortened for replay.]`
-      : text;
   const groups: ModelMessage[][] = [];
   for (const message of parsed.data) {
     if (message.role === "assistant") {
-      groups.push([
-        {
-          ...message,
-          content:
-            typeof message.content === "string"
-              ? clipAnswer(message.content)
-              : message.content.map((part) =>
-                  part.type === "text"
-                    ? { ...part, text: clipAnswer(part.text) }
-                    : part,
-                ),
-        },
-      ]);
+      // Reasoning and signatures belong with the tool calls they precede; without a call
+      // (e.g. a thinking model's final step) they would replay as an unpaired assistant turn.
+      const content =
+        Array.isArray(message.content) &&
+        message.content.some((part) => part.type === "tool-call")
+          ? message.content.filter((part) => part.type !== "text")
+          : [];
+      groups.push(
+        content.length
+          ? [
+              {
+                ...message,
+                content,
+              },
+            ]
+          : [],
+      );
     } else if (message.role === "tool" && groups.length) {
       groups.at(-1)!.push({
         ...message,

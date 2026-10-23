@@ -1,4 +1,4 @@
-// Ported from SignLoop at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+// Ported from SignLoop at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
 import { expect, it } from "vitest";
 import {
   compactAgentMessages,
@@ -153,10 +153,11 @@ it("compacts large tool results while retaining valid call/result pairs", () => 
     },
     { role: "assistant", content: "Answer" },
   ]);
-  expect(replay).toHaveLength(3);
+  expect(replay).toHaveLength(2);
   expect(JSON.stringify(replay).length).toBeLessThan(20000);
   expect(parseAgentMessages(replay)).toEqual(replay);
   expect(JSON.stringify(replay)).toContain("read the source again");
+  expect(JSON.stringify(replay)).not.toContain("Answer");
 });
 
 it("drops incomplete tool exchanges without leaving orphaned results", () => {
@@ -206,8 +207,39 @@ it("preserves source IDs independently when replay is too large for the history 
   ).toEqual({ role: "assistant", content: "Answer", webSources: sources });
 });
 
-it("replays an earlier answer at its canonical length and marks only longer ones", () => {
-  const exchange = [
+it("strips assistant prose from replay while keeping signed tool calls paired with results", () => {
+  const signature = { google: { thoughtSignature: "sig-1" } };
+  const replay = compactAgentMessages([
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Let me check that page." },
+        {
+          type: "tool-call",
+          toolCallId: "c1",
+          toolName: "read_url",
+          input: { url: "https://source.test/" },
+          providerOptions: signature,
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "c1",
+          toolName: "read_url",
+          output: { type: "json", value: { content: "Evidence" } },
+        },
+      ],
+    },
+    { role: "assistant", content: "b".repeat(5_000) },
+    { role: "assistant", content: [{ type: "text", text: "Final answer" }] },
+  ]);
+
+  // The canonical answer is replayed once from message content, so no prose is retained here.
+  expect(replay).toEqual([
     {
       role: "assistant",
       content: [
@@ -216,6 +248,49 @@ it("replays an earlier answer at its canonical length and marks only longer ones
           toolCallId: "c1",
           toolName: "read_url",
           input: { url: "https://source.test/" },
+          providerOptions: signature,
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "c1",
+          toolName: "read_url",
+          output: { type: "json", value: { content: "Evidence" } },
+        },
+      ],
+    },
+  ]);
+  expect(parseClientAgentMessages(replay)).toEqual(replay);
+  // A transcript with no tool exchange adds nothing beyond the canonical answer.
+  expect(
+    compactAgentMessages([
+      { role: "assistant", content: [{ type: "text", text: "Only prose" }] },
+      { role: "assistant", content: "More prose" },
+    ]),
+  ).toBeUndefined();
+});
+
+it("drops reasoning-only assistant steps while keeping reasoning signed with tool calls", () => {
+  const signature = { google: { thoughtSignature: "sig-1" } };
+  const exchange = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "reasoning",
+          text: "Need a source.",
+          providerOptions: signature,
+        },
+        {
+          type: "tool-call",
+          toolCallId: "c1",
+          toolName: "read_url",
+          input: { url: "https://source.test/" },
+          providerOptions: signature,
         },
       ],
     },
@@ -231,32 +306,32 @@ it("replays an earlier answer at its canonical length and marks only longer ones
       ],
     },
   ];
-  const answerText = (replay: ReturnType<typeof compactAgentMessages>) => {
-    const answer = replay?.at(-1);
-    if (answer?.role !== "assistant") return undefined;
-    return typeof answer.content === "string"
-      ? answer.content
-      : answer.content
-          .map((part) => (part.type === "text" ? part.text : ""))
-          .join("");
+  // A thinking model's final step is reasoning plus the answer; the answer is replayed separately.
+  const finalStep = {
+    role: "assistant",
+    content: [
+      { type: "reasoning", text: "Summarize.", providerOptions: signature },
+      { type: "text", text: "Final answer" },
+    ],
   };
-
-  const complete = "a".repeat(3_500);
+  const replay = compactAgentMessages([...exchange, finalStep]);
+  expect(replay).toEqual(exchange);
+  expect(parseClientAgentMessages(replay)).toEqual(replay);
+  expect(compactAgentMessages([finalStep])).toBeUndefined();
   expect(
-    answerText(
-      compactAgentMessages([
-        ...exchange,
-        { role: "assistant", content: [{ type: "text", text: complete }] },
-      ]),
-    ),
-  ).toBe(complete);
-
-  const clipped = compactAgentMessages([
-    ...exchange,
-    { role: "assistant", content: "b".repeat(5_000) },
-  ]);
-  expect(answerText(clipped)).toBe(
-    `${"b".repeat(4_000)}\n[Earlier answer shortened for replay.]`,
-  );
-  expect(parseAgentMessages(clipped)).toEqual(clipped);
+    compactAgentMessages([
+      {
+        role: "assistant",
+        content: [{ type: "reasoning", text: "Thinking only." }],
+      },
+    ]),
+  ).toBeUndefined();
+  // Reasoning between a call and its result must not adopt the result into its own group.
+  expect(
+    compactAgentMessages([
+      exchange[0],
+      { role: "assistant", content: [{ type: "reasoning", text: "Hmm." }] },
+      exchange[1],
+    ]),
+  ).toBeUndefined();
 });

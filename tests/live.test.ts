@@ -32,10 +32,21 @@ describe.skipIf(!runLiveTests)("live provider smoke test", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, unknown>;
     expect(body.message).toEqual(expect.any(String));
-    expect(body.provider).toMatch(/^(primary-openai-compatible|openrouter)$/);
+    expect(body.provider).toMatch(
+      /^(gemini|primary-openai-compatible|openrouter)$/,
+    );
     expect(body.model).toEqual(expect.any(String));
+    // Strict research succeeded, so at least one source was fetched during this turn.
+    expect(body.readSources).toEqual(
+      expect.arrayContaining([expect.any(Number)]),
+    );
     expect(body.webSources).toEqual(
-      expect.arrayContaining([expect.any(Object)]),
+      expect.arrayContaining([
+        expect.objectContaining({
+          number: expect.any(Number),
+          url: expect.any(String),
+        }),
+      ]),
     );
   }, 300_000);
 });

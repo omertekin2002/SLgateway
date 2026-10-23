@@ -2,7 +2,7 @@
 
 A standalone, stateless HTTP service running SignLoop's agentic chat engine on Bun and Render. The answering model can search, read web pages and PDFs, fetch public API data, and optionally generate images across multiple model steps. Callers retain their own conversation history.
 
-The engine is ported from SignLoop commit `3f830abaae4d47dedecabea3fca57a4899a8f688`. See [SOURCE_PROVENANCE.md](./SOURCE_PROVENANCE.md) for the copied modules and standalone adaptations.
+The engine is synced with SignLoop commit `7605fea16c981b1f027ae54e6ef03aada3363b1c`. See [SOURCE_PROVENANCE.md](./SOURCE_PROVENANCE.md) for the copied modules and standalone adaptations.
 
 ## Architecture
 
@@ -22,7 +22,7 @@ client sends text + optional tool history/source catalog
   -> JSON or NDJSON response
 ```
 
-There is no database, Clerk integration, saved-thread API, contract datastore, upload handling, or persistent disk requirement. Private contract tools, chat naming, and SignLoop's UI remain in SignLoop. Optional generated images are returned inline; the service does not store them. Langfuse tracing is not enabled in this service.
+There is no database, WorkOS/Clerk authentication, saved-thread API, contract datastore, upload handling, or persistent disk requirement. Private contract tools and their egress guard, chat naming, usage quotas, and SignLoop's UI remain in SignLoop. Optional generated images are returned inline; the service does not store them. Langfuse tracing is not enabled in this service.
 
 ## Local setup
 
@@ -116,13 +116,19 @@ The strict check establishes that fresh evidence was retrieved. It does not esta
     "query": "model-selected query",
     "attemptedQueries": ["model-selected query"],
     "successfulSearches": 1,
-    "sources": [{ "title": "Source title", "url": "https://example.com/page" }]
+    "sources": [
+      {
+        "number": 1,
+        "title": "Source title",
+        "url": "https://example.com/page"
+      }
+    ]
   },
   "webSearchQuery": "model-selected query",
   "webSearchAttempts": ["model-selected query"],
   "webSearchSuccessfulCount": 1,
   "webSources": [
-    { "title": "Source title", "url": "https://example.com/page" }
+    { "number": 1, "title": "Source title", "url": "https://example.com/page" }
   ],
   "toolActivity": [
     {
@@ -137,9 +143,9 @@ The strict check establishes that fresh evidence was retrieved. It does not esta
 }
 ```
 
-`provider` is `gemini`, `primary-openai-compatible`, or `openrouter`. It identifies the last selected text provider; different completed steps can use different providers after fallback. `agentMessages`, when present, contains the SDK assistant/tool exchanges for future turns. These are bounded and can be omitted when there is no useful tool replay.
+`provider` is `gemini`, `primary-openai-compatible`, or `openrouter`. It identifies the last selected text provider; different completed steps can use different providers after fallback. `agentMessages`, when present, contains the SDK assistant/tool exchanges for future turns: complete tool-call/result pairs, with assistant prose removed because `message` already carries the answer. They are bounded and omitted when there is no tool exchange to replay.
 
-`webSources` is a cumulative source catalog with stable one-based indices. `readSources` identifies sources fetched during the current turn. The footer lists fetched sources and valid references to earlier sources, preserving their original numbers. Search leads do not enter the catalog until fetched. A direct page/API read can produce sources with no search query. If no catalog exists, `webSearch`/`webSearchQuery` are null and legacy search arrays/counts are empty/zero; `toolActivity` still records searches that produced only unread leads.
+`webSources` is the conversation's bounded source catalog. Each entry carries an explicit, stable citation `number`; citations `[n]`, `readSources`, and the footer all refer to these numbers, not to array positions. `readSources` lists the numbers fetched during the current turn. The footer lists fetched sources and valid references to earlier sources, preserving their original numbers. When a new page needs room, the oldest inherited entries not read during this turn are retired; their numbers are never reused, so a citation to a retired source simply gets no footer entry. Numbers can therefore have gaps and need not start at 1. Search leads do not enter the catalog until fetched. A direct page/API read can produce sources with no search query. If no catalog exists, `webSearch`/`webSearchQuery` are null and legacy search arrays/counts are empty/zero; `toolActivity` still records searches that produced only unread leads.
 
 `figures` is `ok`, `no-evidence`, or `unmatched`. SignLoop's heuristic checks measured numbers against text fetched during this turn and may append a notice. It is not semantic fact checking and does not validate earlier-turn evidence.
 
@@ -157,9 +163,15 @@ history.push({
 history.push({ role: "user", content: "Explain that source in more detail." });
 ```
 
-Bound the history before sending it. Compact inline generated-image data to a text placeholder before truncating assistant content to 4000 characters. Retain only the newest cumulative source catalog and trim oldest complete user/assistant pairs to satisfy both character and UTF-8 request-byte limits. The updated otekin client implements this.
+Bound the history before sending it. Compact inline generated-image data to a text placeholder before truncating assistant content to 4000 characters. Retain only the newest source catalog, sent back unchanged, and trim oldest complete user/assistant pairs to satisfy both character and UTF-8 request-byte limits. The updated otekin client implements this.
 
-Malformed or oversized replay/catalog fields are dropped. Replay accepts only SDK assistant/tool text and tool exchanges, never system/user instruction roles, media, or approval parts. This prevents SDK media downloads outside the public HTTP tool's guards. Client-supplied replay is conversation context, not trusted proof of research. Legacy text-only clients continue to work but cannot retain full tool evidence between turns.
+The service replays each assistant turn as its compacted tool exchanges followed by its canonical `content`, so the answer is sent to the model once and in full. Older clients that stored replay with assistant prose (including the 4000-character answer copies from the previous gateway release) still work: the prose is stripped from replay and the tool pairs are kept.
+
+Catalogs from older releases have no `number` fields. They are still accepted and read positionally (entry `i` is `[i + 1]`), so existing citations keep their meaning; the reply returns the catalog with explicit numbers, and new sources continue after the highest one. A catalog may mix both forms only if every resulting number is unique. If adding numbers requires pruning during migration, the highest-numbered entry is retained so even a turn with no new reads preserves the allocation watermark, including an exhausted number range. If JSON escaping makes that single numbered entry exceed the cap, its optional snippet is omitted while its title, exact URL, and citation number are preserved.
+
+Clients that render their own source list must resolve citations by each entry's `number`, falling back to position only for numberless entries. The companion fix is in [otekin PR #4](https://github.com/omertekin2002/otekin/pull/4), including terminal hyperlinks and legacy catalogs; see [companion client compatibility](./SOURCE_PROVENANCE.md#companion-client). Installations based on `12b4de8` (version `0.1.8`) still use positions for that display, so distribute the updated client before deploying this gateway release. Its history forwarding already preserves the new fields.
+
+Malformed or oversized replay/catalog fields are dropped, including catalogs with duplicate or invalid numbers (positive safe integers only). Replay accepts only SDK assistant/tool text and tool exchanges, never system/user instruction roles, media, or approval parts. This prevents SDK media downloads outside the public HTTP tool's guards. Client-supplied replay is conversation context, not trusted proof of research. Legacy text-only clients continue to work but cannot retain full tool evidence between turns.
 
 ### Streaming response
 
@@ -208,11 +220,11 @@ The agent uses SignLoop's 20-second stream-opening guard per candidate. Gemini g
 | Image generations                                          |                          2 per turn when enabled |
 | Image payload                                              |                        8 MiB of base64 per image |
 
-Replay keeps each earlier assistant answer up to 4000 characters, matching canonical message content; tool results inside replay are excerpted at 2000 characters.
+Replay keeps no assistant prose; the canonical message supplies the answer once. Tool results inside replay are excerpted at 2000 characters, and older complete exchanges are dropped first when replay exceeds its budget.
 
-The source catalog accumulates across a conversation. Once a new page cannot be numbered, `search_web`, `read_url`, and `http_get` return a tool error before contacting any provider, asking the model to answer from sources already read and suggest a new chat. Pages already in the catalog can still be read again as fresh evidence. In `always` mode, a turn that needs a new page then fails with `research_unavailable`.
+Both catalog caps (entry count and serialized size, including the `number` fields) are enforced on every reply. Inherited sources are retired oldest first to make room; sources fetched during the current turn, including re-reads of inherited pages, are never retired. Only the current turn's own reads can therefore fill the catalog, which in practice means several near-maximum-length addresses within one turn. Before fetching, `read_url` and `http_get` check whether the address could still be numbered and otherwise return a tool error without contacting the reader or target; `search_web` makes the same check for a minimal entry. If a fetched page's real title or redirected address does not fit, the tool returns the same error and the page is not cited. Pages already in the catalog can always be read again as fresh evidence. In `always` mode, a turn that could not fetch any fresh evidence still fails with `research_unavailable`.
 
-Public HTTP fetching validates each redirect and resolved socket address, blocks private/reserved IPs and credential-bearing URLs, and bounds response size. Requests to hosted readers also validate the requested URL. Retrieved text is marked as untrusted data.
+Public HTTP fetching validates each redirect and resolved socket address, blocks private/reserved IPs and credential-bearing URLs, and bounds response size. Requests to hosted readers also validate the requested URL. Retrieved text is fenced as untrusted data; `<<`/`>>` runs inside it are broken up so a page cannot forge the fence markers.
 
 ### Errors and request IDs
 

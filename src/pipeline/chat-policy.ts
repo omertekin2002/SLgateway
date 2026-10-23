@@ -1,15 +1,15 @@
-// Ported from SignLoop apps/web/lib/chat-policy.ts at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+// Ported from SignLoop apps/web/lib/chat-policy.ts and chat-history-bounds.ts at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
 import type { ModelMessage } from "ai";
 import type { ChatMessage, ChatRole } from "./chat";
 import { isRecord } from "../utils";
-import {
-  isPlainAssistantReplay,
-  parseAgentMessages,
-  parseWebSources,
-} from "./chat-agent-history";
+import { parseAgentMessages } from "./chat-agent-history";
+import { isPlainAssistantReplay, parseWebSources } from "./chat-history-shared";
 import { withAbort } from "./bounded-response";
-export { MAX_AGENT_STATE_CHARACTERS } from "./chat-agent-history";
+export { MAX_AGENT_STATE_CHARACTERS } from "./chat-history-shared";
 
+// SignLoop moved these transport bounds and the history-bounding helpers below into
+// chat-history-bounds.ts so its browser client avoids runtime "ai" imports. The gateway has no
+// client; its only upstream behavior change there (contract receipts) is app-only.
 export const MAX_CHAT_MESSAGES = 30;
 export const MAX_CHAT_MESSAGE_LENGTH = 4_000;
 export const MAX_CHAT_TOTAL_MESSAGE_LENGTH = 60_000;
