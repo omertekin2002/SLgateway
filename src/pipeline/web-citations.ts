@@ -1,13 +1,14 @@
-// Ported from SignLoop apps/web/lib/web-citations.ts at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+// Ported from SignLoop apps/web/lib/web-citations.ts at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
 import { marked } from "marked";
 import type { WebSearchSource } from "./gemini-search";
+import { sourceCitationNumber } from "./chat-history-shared";
 
 // Post-processing applied to a finished answer. Everything here works from server-side ground
 // truth — which pages were actually fetched, and what text came back — rather than from the
 // model's prose, because the prose is exactly what cannot be trusted.
 
 /** Models trained on OpenAI's citation format emit 【1†L23-L26】 where the prompt asked for [1]. */
-const FOREIGN_CITATION_MARKER = /【\s*(\d{1,3})\s*(?:†[^】]*)?】/g;
+const FOREIGN_CITATION_MARKER = /【\s*(\d+)\s*(?:†[^】]*)?】/g;
 
 /** Measured quantities: decimals and grouped thousands. */
 // Bare integers are deliberately excluded — "3 reasons" and "September 2026" are not claims that
@@ -98,7 +99,7 @@ export function appendWebSourcesToMessage(
   message: string,
   sources: readonly WebSearchSource[],
   options?: {
-    /** 1-based numbers of pages fetched during this turn; listed whether or not they were cited. */
+    /** Stable numbers of pages fetched during this turn; listed whether or not they were cited. */
     readThisTurn?: readonly number[];
     figures?: FigureVerification;
   },
@@ -112,21 +113,24 @@ export function appendWebSourcesToMessage(
       : null;
   const withNotice = notice ? `${normalized.trim()}\n\n${notice}` : normalized;
   if (!sources.length) return withNotice;
+  const catalog = new Map(
+    sources.map((source, index) => [
+      sourceCitationNumber(source, index),
+      source,
+    ]),
+  );
 
   // Ground truth first: anything fetched this turn is listed even when the model cited nothing,
   // so a missing citation can no longer hide which pages an answer was built from.
   const listed = new Set<number>(
-    (options?.readThisTurn ?? []).filter(
-      (number) =>
-        Number.isInteger(number) && number >= 1 && number <= sources.length,
-    ),
+    (options?.readThisTurn ?? []).filter((number) => catalog.has(number)),
   );
   // Sources carried over from earlier turns are listed only where this answer cites them.
   marked.walkTokens(marked.lexer(normalized), (token) => {
     if (token.type !== "text") return;
     for (const match of token.raw.matchAll(/\[(\d+)\]/g)) {
       const number = Number(match[1]);
-      if (number >= 1 && number <= sources.length) listed.add(number);
+      if (catalog.has(number)) listed.add(number);
     }
   });
   if (!listed.size) return withNotice;
@@ -134,7 +138,7 @@ export function appendWebSourcesToMessage(
   const links = [...listed]
     .sort((a, b) => a - b)
     .map((number) => {
-      const source = sources[number - 1]!;
+      const source = catalog.get(number)!;
       // Explicit labels preserve citation numbers when only a subset is used.
       const title = escapeMarkdownLabel(source.title);
       const url = safeSourceUrl(source.url);

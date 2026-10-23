@@ -1,4 +1,4 @@
-// Ported from SignLoop apps/web/lib/chat.ts at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+// Ported from SignLoop apps/web/lib/chat.ts at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
 import {
   ToolLoopAgent,
   isStepCount,
@@ -25,17 +25,14 @@ import {
   createHttpGetTool,
   createImageTool,
   createUrlReaderTool,
-  SOURCE_CATALOG_FULL_MESSAGE,
-  SourceCatalogFullError,
 } from "./chat-tools";
 import { verifyFigures, type FigureVerification } from "./web-citations";
 import { isRecord } from "../utils";
+import { compactAgentMessages } from "./chat-agent-history";
 import {
-  compactAgentMessages,
-  isPlainAssistantReplay,
-  MAX_SOURCE_COUNT,
-  MAX_SOURCE_CATALOG_CHARACTERS,
-} from "./chat-agent-history";
+  createChatSourceCatalog,
+  SOURCE_CATALOG_FULL_MESSAGE,
+} from "./chat-source-catalog";
 
 // Provider warnings can contain raw upstream details. The gateway logs only allowlisted metadata.
 globalThis.AI_SDK_LOG_WARNINGS = false;
@@ -121,7 +118,7 @@ export type ChatReply = {
   webSearch: WebSearchMetadata | null;
   agentMessages?: ModelMessage[];
   toolActivity?: ChatToolActivity[];
-  /** 1-based catalog numbers of the pages fetched during this turn. */
+  /** Stable citation numbers of the pages fetched during this turn. */
   readSources?: number[];
   /** Whether the answer's measured figures trace back to the text that was fetched. */
   figures?: FigureVerification;
@@ -202,14 +199,19 @@ export async function* generateChatReplyStream(
     logger: options.dependencies?.logger,
     fetch: options.dependencies?.fetch,
   });
-  // Carry the source catalog with saved tool exchanges so follow-up citations retain their IDs.
-  const sources: WebSearchMetadata["sources"] = [
-    ...([...messages].reverse().find((message) => message.webSources?.length)
-      ?.webSources ?? []),
-  ];
-  // Pages fetched during THIS turn, as 1-based catalog numbers. The catalog itself is seeded from
-  // earlier turns to keep citation numbers stable, so "in the catalog" is not "read just now".
-  const readThisTurn = new Set<number>();
+  // Carry the source catalog with replayed tool exchanges so follow-up citations retain their IDs.
+  // Pages fetched during THIS turn are tracked separately: "in the catalog" is not "read just now".
+  // Inherited sources are retired to make room, so only this turn's own reads can fill it; once
+  // they do, hasSourceRoom stops searches and reads whose results would be discarded.
+  const {
+    sources,
+    readThisTurn,
+    addSource,
+    hasRoom: hasSourceRoom,
+  } = createChatSourceCatalog(
+    [...messages].reverse().find((message) => message.webSources?.length)
+      ?.webSources ?? [],
+  );
   const evidence: string[] = [];
   const queries: string[] = [];
   let successfulSearches = 0;
@@ -217,29 +219,6 @@ export async function* generateChatReplyStream(
   const cache = new Map<string, Promise<unknown>>();
   const activities = new Map<string, ChatToolActivity>();
   const agentMessages: ModelMessage[] = [];
-  const addSource = (source: WebSearchMetadata["sources"][number]): number => {
-    let index = sources.findIndex((existing) => existing.url === source.url);
-    if (index < 0) {
-      if (
-        sources.length >= MAX_SOURCE_COUNT ||
-        JSON.stringify([...sources, source]).length >
-          MAX_SOURCE_CATALOG_CHARACTERS
-      )
-        throw new SourceCatalogFullError();
-      index = sources.length;
-      sources.push(source);
-    }
-    readThisTurn.add(index + 1);
-    return index + 1;
-  };
-  // The catalog only grows across a conversation. Once a new page cannot be numbered, stop paying
-  // for searches and reads whose results would be discarded. The title is unknown before a fetch,
-  // so this is a lower bound; addSource still enforces the exact limit.
-  const hasSourceRoom = (url = ""): boolean =>
-    sources.some((existing) => existing.url === url) ||
-    (sources.length < MAX_SOURCE_COUNT &&
-      JSON.stringify([...sources, { title: "", url }]).length <=
-        MAX_SOURCE_CATALOG_CHARACTERS);
   const toolNotes: string[] = [];
   const tools: ToolSet = {};
   if (enableResearch) {
@@ -370,13 +349,14 @@ export async function* generateChatReplyStream(
       onError: () => {},
       messages: messages
         .filter((message) => message.role !== "system")
-        .flatMap((message): ModelMessage[] =>
-          message.role === "assistant" &&
-          message.agentMessages?.length &&
-          !isPlainAssistantReplay(message.agentMessages)
-            ? message.agentMessages
-            : [{ role: message.role, content: message.content }],
-        ),
+        .flatMap((message): ModelMessage[] => [
+          // Also strips clipped prose from legacy replay metadata. Tool pairs remain intact;
+          // the full answer follows once as the canonical message content.
+          ...(message.role === "assistant" && message.agentMessages?.length
+            ? (compactAgentMessages(message.agentMessages) ?? [])
+            : []),
+          { role: message.role, content: message.content },
+        ]),
       abortSignal: signal,
     };
     const result = await agent.stream(streamOptions);

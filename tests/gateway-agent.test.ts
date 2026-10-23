@@ -190,6 +190,9 @@ it("runs the real HTTP + SDK + reader path and replays evidence on the next turn
   const reply = await first.json();
   expect(reply.message).toContain("- [1] [Source](<https://source.test/page>)");
   expect(reply.readSources).toEqual([1]);
+  expect(reply.webSources).toEqual([
+    { number: 1, title: "Source", url: "https://source.test/page" },
+  ]);
   expect(reply.toolActivity).toEqual([
     expect.objectContaining({ tool: "read_url", status: "complete" }),
   ]);
@@ -219,13 +222,116 @@ it("runs the real HTTP + SDK + reader path and replays evidence on the next turn
   const followup = await second.json();
   expect(followup.readSources).toEqual([]);
   expect(followup.message).toContain("- [1] [Source]");
-  expect(JSON.stringify(providerRequests[2]?.input)).toContain(
-    "Verified source text",
-  );
+  const replayed = JSON.stringify(providerRequests[2]?.input);
+  expect(replayed).toContain("Verified source text");
+  expect(replayed).toContain("function_call_output");
+  // Replay carries the tool exchange; the canonical answer appears once, not twice.
+  expect(replayed.match(/Verified answer/g)).toHaveLength(1);
   expect(JSON.stringify(log.mock.calls)).not.toMatch(
     /test-only-secret|Verified source text|Read the page/,
   );
 });
+
+it.each([false, true])(
+  "migrates and replays a full legacy catalog over HTTP (stream=%s)",
+  async (streaming) => {
+    let step = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/models"))
+          return Response.json({ data: [{ id: "test" }] });
+        if (url.startsWith("https://r.jina.ai/"))
+          return Response.json({
+            data: { title: "Source", content: "Fresh evidence" },
+          });
+        return step++ === 0
+          ? readPage()
+          : answer("New [65], older [2], gone [1]");
+      }),
+    );
+    const legacy = Array.from({ length: 64 }, (_, index) => ({
+      title: `Old ${index + 1}`,
+      url: `https://old.test/${index + 1}`,
+    }));
+    const handler = createRequestHandler({ config: config(), log: () => {} });
+    const response = await handler(
+      request(
+        [
+          { role: "user", content: "Earlier question" },
+          {
+            role: "assistant",
+            content: "Earlier answer [1]",
+            webSources: legacy,
+          },
+          { role: "user", content: "Read a new page" },
+        ],
+        streaming,
+      ),
+    );
+    expect(response.status).toBe(200);
+    const reply = streaming
+      ? (await response.text())
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+          .at(-1)
+      : await response.json();
+    if (streaming) expect(reply.type).toBe("done");
+    expect(reply.readSources).toEqual([65]);
+    expect(reply.webSources).toHaveLength(64);
+    expect(reply.webSources[0]).toEqual({
+      number: 2,
+      title: "Old 2",
+      url: "https://old.test/2",
+    });
+    expect(reply.webSources.at(-1)).toEqual({
+      number: 65,
+      title: "Source",
+      url: "https://source.test/page",
+    });
+    expect(reply.message).toContain("- [2] [Old 2](<https://old.test/2>)");
+    expect(reply.message).toContain(
+      "- [65] [Source](<https://source.test/page>)",
+    );
+    expect(reply.message).not.toMatch(/^- \[1\] /m);
+
+    // The caller returns the new wire state unchanged. Its gapped IDs must survive another
+    // request, and earlier evidence alone must not be reported as freshly fetched this turn.
+    const followup = await handler(
+      request(
+        [
+          { role: "user", content: "Read a new page" },
+          {
+            role: "assistant",
+            content: reply.message,
+            agentMessages: reply.agentMessages,
+            webSources: reply.webSources,
+          },
+          { role: "user", content: "Explain those sources" },
+        ],
+        streaming,
+      ),
+    );
+    expect(followup.status).toBe(200);
+    const repeated = streaming
+      ? (await followup.text())
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+          .at(-1)
+      : await followup.json();
+    if (streaming) expect(repeated.type).toBe("done");
+    expect(repeated.webSources).toEqual(reply.webSources);
+    expect(repeated.readSources).toEqual([]);
+    expect(repeated.message).toContain("- [2] [Old 2](<https://old.test/2>)");
+    expect(repeated.message).toContain(
+      "- [65] [Source](<https://source.test/page>)",
+    );
+    expect(repeated.message).not.toMatch(/^- \[1\] /m);
+  },
+);
 
 it("streams tool activity before the canonical answer through the real HTTP boundary", async () => {
   let step = 0;
