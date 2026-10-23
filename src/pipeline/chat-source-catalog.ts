@@ -57,7 +57,8 @@ export function createChatSourceCatalog(inherited: readonly WebSearchSource[]) {
     /**
      * Gateway addition: whether a page at this address could be numbered, checked before paying
      * for a fetch. The title is unknown until then, so this is a lower bound; addSource enforces
-     * the exact limit.
+     * the exact limit. Reserving the longest escaped title would refuse pages that fit, and an
+     * http_get redirect changes the address anyway, so a page that does not fit is refused uncited.
      */
     hasRoom(url = ""): boolean {
       if (sources.some((entry) => entry.url === url)) return true;

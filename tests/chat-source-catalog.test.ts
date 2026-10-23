@@ -101,6 +101,58 @@ describe("bounded chat source catalogs", () => {
     expect(catalog.hasRoom(catalog.sources[0]!.url)).toBe(true);
   });
 
+  it("checks room before a fetch without reserving a title the page may not have", () => {
+    const nearlyFull = () => {
+      const catalog = createChatSourceCatalog([
+        { number: 1, title: "Old", url: "https://old.test/" },
+      ]);
+      for (let index = 0; index < 7; index++)
+        catalog.addSource({
+          title: "T".repeat(240),
+          url: `https://read.test/${index}/${"x".repeat(1900)}`,
+        });
+      const current = catalog.sources.filter((source) =>
+        catalog.readThisTurn.has(source.number),
+      );
+      let url = "https://new.test/";
+      // Leave 100 characters beyond an empty-titled entry for the new page.
+      const spare =
+        MAX_SOURCE_CATALOG_CHARACTERS -
+        JSON.stringify([...current, { number: 9, title: "", url }]).length;
+      url += "p".repeat(spare - 100);
+      expect(spare).toBeGreaterThan(100);
+      expect(url.length).toBeLessThanOrEqual(2048);
+      expect(catalog.sources.map((source) => source.number)).toEqual([
+        1, 2, 3, 4, 5, 6, 7, 8,
+      ]);
+      return { catalog, url };
+    };
+
+    // A typical title fits, so the page is read, numbered, and the inherited entry retires.
+    const fits = nearlyFull();
+    expect(fits.catalog.hasRoom(fits.url)).toBe(true);
+    expect(
+      fits.catalog.addSource({ title: "A".repeat(60), url: fits.url }),
+    ).toBe(9);
+    expect(fits.catalog.sources.map((source) => source.number)).toEqual([
+      2, 3, 4, 5, 6, 7, 8, 9,
+    ]);
+    expect(parseWebSources(fits.catalog.sources)).toEqual(fits.catalog.sources);
+
+    // A title too long once serialized, including JSON escapes, is refused after the fetch
+    // without changing the catalog.
+    for (const title of ["T".repeat(240), "\u0001".repeat(60)]) {
+      const { catalog, url } = nearlyFull();
+      const before = JSON.stringify(catalog.sources);
+      expect(catalog.hasRoom(url)).toBe(true);
+      expect(() => catalog.addSource({ title, url })).toThrow(
+        SourceCatalogFullError,
+      );
+      expect(JSON.stringify(catalog.sources)).toBe(before);
+      expect([...catalog.readThisTurn]).toEqual([2, 3, 4, 5, 6, 7, 8]);
+    }
+  });
+
   it("rejects duplicate citation numbers and supports catalogs with large stable IDs", () => {
     expect(
       parseWebSources([
