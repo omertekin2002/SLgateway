@@ -292,6 +292,7 @@ function extractGroundedResult(
   };
 }
 
+/** Select model-compatible high thinking settings with output room for the grounded brief. */
 function buildGenerationConfig(model: string): Record<string, unknown> {
   // generateContent uses token budgets for Gemini 2.5 and named levels for Gemini 3+.
   // Use the largest supported 2.5 thinking budget, leaving room for the search brief.
@@ -421,6 +422,7 @@ function getPublicWebSearchErrorMessage(message: string): string {
   return "Gemini web search failed. Please try again.";
 }
 
+/** Return bounded Google-grounded evidence, preserving cancellation and safe public errors. */
 export async function searchWeb(
   query: string,
   options: GeminiSearchOptions = {},

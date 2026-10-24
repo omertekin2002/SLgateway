@@ -57,6 +57,7 @@ const TOOL_NOTES = {
 const NO_TOOLS_INSTRUCTIONS =
   "No tools are available in this session. Do not claim to search, read pages, or open documents.";
 
+/** Describe the enabled tools and their evidence rules for the answering model. */
 function buildToolInstructions(notes: string[]): string {
   if (!notes.length) return NO_TOOLS_INSTRUCTIONS;
   return `
@@ -85,6 +86,7 @@ const CHAT_TOOL_NAMES = new Set<string>([
   "http_get",
   "generate_image",
 ]);
+/** Narrow SDK tool events to the public tools exposed by this gateway. */
 export function isChatToolName(value: string): value is ChatToolName {
   return CHAT_TOOL_NAMES.has(value);
 }
@@ -145,6 +147,7 @@ export type ChatGenerationOptions = {
   };
 };
 
+/** Stream an agentic turn with tool progress and provider fallback between model steps. */
 export async function* generateChatReplyStream(
   messages: readonly ChatMessage[],
   options: ChatGenerationOptions,
@@ -458,6 +461,7 @@ export async function* generateChatReplyStream(
   }
 }
 
+/** Collect the streaming agent's canonical final reply for non-streaming callers. */
 export async function generateChatReply(
   messages: readonly ChatMessage[],
   options: ChatGenerationOptions,

@@ -77,6 +77,8 @@ An explicit search provider selects one integration; it is not a retry chain bet
 
 Image generation is disabled unless explicitly enabled and discovery confirms the configured image model. The Render Blueprint enables it and requires `PRIMARY_LLM_BASE_URL` and `PRIMARY_LLM_API_KEY`. An unavailable discovery endpoint does not expose the image tool. Images use the primary endpoint even when text generation has fallen back to OpenRouter.
 
+Before syncing this Blueprint to an existing service, manually provision both primary credentials in Render. Render prompts for `sync: false` values only when creating a Blueprint and ignores newly added `sync: false` entries on later updates; see [Render's secret-value instructions](https://render.com/docs/blueprint-spec#prompting-for-secret-values). Keep `ENABLE_IMAGE_GENERATION=false` on services without the credentials until they are provisioned.
+
 ## Public API
 
 - `GET /healthz` → `{"ok":true,"service":"signloop-chat-service"}`

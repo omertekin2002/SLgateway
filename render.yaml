@@ -26,6 +26,8 @@ services:
         value: 4
       - key: REQUEST_TIMEOUT_MS
         value: 275000
+      # Before syncing an existing service, provision both PRIMARY_LLM credentials manually.
+      # New sync:false entries are prompted only when creating a Blueprint.
       - key: ENABLE_IMAGE_GENERATION
         value: "true"
       - key: IMAGE_GENERATION_MODEL
