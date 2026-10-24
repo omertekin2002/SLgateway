@@ -1,4 +1,4 @@
-// Ported from SignLoop at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
+// Ported from SignLoop at 61c90b508a789cee988acdded52b2d1a8c82ee69.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MockLanguageModelV4 } from "ai/test";
 import {
@@ -576,7 +576,7 @@ describe("agentic chat", () => {
     const markdown = "![Generated image](data:image/png;base64,AAAA)";
     mocks.generateImage.mockResolvedValue({
       message: markdown,
-      model: "gpt-image-2",
+      model: "gpt-image-2.5-sunburst",
       provider: "primary-openai-compatible",
     });
     const model = sequencedModel([
@@ -591,7 +591,7 @@ describe("agentic chat", () => {
     expect(mocks.generateImage).toHaveBeenCalledWith(
       "a signed contract on a desk",
       expect.objectContaining({
-        model: "gpt-image-2",
+        model: "gpt-image-2.5-sunburst",
         providerConfig: baseOptions.providerConfig,
       }),
     );
@@ -685,7 +685,7 @@ function optionsFor(options: UpstreamTestOptions = {}): ChatGenerationOptions {
       options.enableWebSearch || options.enableUrlReader ? "auto" : "never",
     imageGeneration: {
       enabled: options.enableImageGeneration ?? false,
-      model: "gpt-image-2",
+      model: "gpt-image-2.5-sunburst",
     },
     firstChunkTimeoutMs: options.firstChunkTimeoutMs,
   };
@@ -1085,7 +1085,12 @@ it("tries the primary first, then high-thinking Gemini, then OpenRouter", async 
   expect(calls).toEqual(["primary", "gemini", "openrouter"]);
   expect(reply).toMatchObject({ provider: "openrouter", model: "fallback" });
   expect(gemini.doStreamCalls[0]?.providerOptions).toEqual({
-    openai: { store: false },
+    openai: {
+      store: false,
+      reasoningEffort: "high",
+      forceReasoning: true,
+      reasoningSummary: null,
+    },
     google: { thinkingConfig: { thinkingLevel: "high" } },
   });
 });
@@ -1204,7 +1209,7 @@ it("checks text and image model availability concurrently", async () => {
 
   const reply = generateReply(messages, {
     ...baseOptions,
-    imageGeneration: { enabled: true, model: "gpt-image-2" },
+    imageGeneration: { enabled: true, model: "gpt-image-2.5-sunburst" },
     dependencies: {
       discoverModel: async (config) => {
         started.push(config.model);
@@ -1214,7 +1219,7 @@ it("checks text and image model availability concurrently", async () => {
     },
   });
 
-  await vi.waitFor(() => expect(started).toEqual(["primary", "gpt-image-2"]));
+  await vi.waitFor(() => expect(started).toEqual(["primary", "gpt-image-2.5-sunburst"]));
   release();
   await expect(reply).resolves.toMatchObject({
     provider: "primary-openai-compatible",
@@ -1228,10 +1233,10 @@ it.each(["unavailable", "unknown"] as const)(
     mocks.responses.mockReturnValue(model);
     await generateReply(messages, {
       ...baseOptions,
-      imageGeneration: { enabled: true, model: "gpt-image-2" },
+      imageGeneration: { enabled: true, model: "gpt-image-2.5-sunburst" },
       dependencies: {
         discoverModel: async (config) =>
-          config.model === "gpt-image-2" ? availability : "available",
+          config.model === "gpt-image-2.5-sunburst" ? availability : "available",
       },
     });
     expect(

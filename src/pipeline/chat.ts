@@ -1,4 +1,4 @@
-// Ported from SignLoop apps/web/lib/chat.ts at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
+// Ported from SignLoop apps/web/lib/chat.ts at 61c90b508a789cee988acdded52b2d1a8c82ee69.
 import {
   ToolLoopAgent,
   isStepCount,
@@ -18,6 +18,7 @@ import { createRoutedModel } from "./agent-provider";
 export { createRoutedModel, FirstChunkTimeoutError } from "./agent-provider";
 import { discoverPrimaryModelAvailability } from "./provider-models";
 import { ResearchUnavailableError, type ResearchMode } from "./research-policy";
+import { TEXT_REASONING_EFFORT } from "./reasoning-policy";
 import type { WebSearchMetadata } from "./gemini-search";
 import { searchWeb } from "./web-search";
 import { buildAuthoritativeUtcTimeContext } from "./chat-time";
@@ -322,9 +323,15 @@ export async function* generateChatReplyStream(
     maxOutputTokens: options?.maxOutputTokens,
     maxRetries: 0,
     providerOptions: {
-      openai: { store: false },
+      openai: {
+        store: false,
+        reasoningEffort: TEXT_REASONING_EFFORT,
+        // Compatible gateways and OpenRouter use aliases the SDK cannot classify itself.
+        forceReasoning: true,
+        reasoningSummary: null,
+      },
       // Gemini streams nothing while it thinks; agent-provider gives it a longer opening deadline.
-      google: { thinkingConfig: { thinkingLevel: "high" } },
+      google: { thinkingConfig: { thinkingLevel: TEXT_REASONING_EFFORT } },
     },
     prepareStep: ({ stepNumber }) => {
       if (stepNumber >= MAX_STEPS - 1) return { toolChoice: "none" as const };

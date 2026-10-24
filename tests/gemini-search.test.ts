@@ -1,4 +1,4 @@
-// Ported from SignLoop at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+// Ported from SignLoop at 61c90b508a789cee988acdded52b2d1a8c82ee69.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { searchWeb as search } from "../src/pipeline/gemini-search";
 
@@ -47,6 +47,40 @@ function groundedResponse(input?: {
 }
 
 describe("searchWeb", () => {
+  it.each([
+    ["gemini-2.5-flash", { thinkingBudget: 24_576 }, 26_624],
+    ["gemini-2.5-flash-preview-05-20", { thinkingBudget: 24_576 }, 26_624],
+    ["gemini-2.5-flash-lite", { thinkingBudget: 24_576 }, 26_624],
+    ["gemini-2.5-pro", { thinkingBudget: 32_768 }, 34_816],
+    ["models/gemini-2.5-pro", { thinkingBudget: 32_768 }, 34_816],
+    ["gemini-3-flash-preview", { thinkingLevel: "HIGH" }, 32_768],
+    ["gemini-3.8-flash", { thinkingLevel: "HIGH" }, 32_768],
+    ["gemini-4-argon", { thinkingLevel: "HIGH" }, 32_768],
+  ] as const)(
+    "requests high thinking for %s with room for the grounded brief",
+    async (model, thinkingConfig, maxOutputTokens) => {
+      const fetchMock = vi.fn().mockResolvedValue(groundedResponse());
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await search("current regulations", {
+        apiKey: "test-key",
+        model,
+      });
+
+      expect(result.brief).toBe("Fresh research brief");
+      expect(String(fetchMock.mock.calls[0]![0])).toContain(
+        `/models/${model.replace(/^models\//, "")}:generateContent`,
+      );
+      const request = JSON.parse(fetchMock.mock.calls[0]![1].body);
+      expect(request.generationConfig).toEqual({
+        temperature: 0.1,
+        thinkingConfig,
+        maxOutputTokens,
+      });
+      expect(request.tools).toEqual([{ google_search: {} }]);
+    },
+  );
+
   it("executes the model's query and returns structured grounded evidence", async () => {
     vi.stubEnv("GEMINI_API_KEY", "test-key");
     const fetchMock = vi.fn().mockResolvedValue(groundedResponse());

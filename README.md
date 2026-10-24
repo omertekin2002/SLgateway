@@ -2,7 +2,7 @@
 
 A standalone, stateless HTTP service running SignLoop's agentic chat engine on Bun and Render. The answering model can search, read web pages and PDFs, fetch public API data, and optionally generate images across multiple model steps. Callers retain their own conversation history.
 
-The engine is synced with SignLoop commit `7605fea16c981b1f027ae54e6ef03aada3363b1c`. See [SOURCE_PROVENANCE.md](./SOURCE_PROVENANCE.md) for the copied modules and standalone adaptations.
+The engine is synced with SignLoop commit `61c90b508a789cee988acdded52b2d1a8c82ee69` ([PR #10](https://github.com/omertekin2002/SignLoop/pull/10)). See [SOURCE_PROVENANCE.md](./SOURCE_PROVENANCE.md) for the copied modules and standalone adaptations.
 
 ## Architecture
 
@@ -52,7 +52,7 @@ Configuration is validated once at startup. Provider URLs, credentials, models, 
 | `PRIMARY_LLM_MODEL`          | `gpt-6.1-sol`                                        | Primary answering model. Set an explicit model advertised by your endpoint that supports Responses tools. Default use emits a safe startup warning. |
 | `OPENROUTER_API_KEY`         | unset                                                 | Enables the OpenRouter fallback, tried after Gemini and primary.                                                                                                                |
 | `OPENROUTER_BASE_URL`        | `https://openrouter.ai/api/v1`                        | OpenRouter-compatible endpoint.                                                                                                                                                 |
-| `OPENROUTER_FALLBACK_MODELS` | `nvidia/nemotron-3-ultra-550b-a55b:free`              | Ordered comma-separated model IDs, deduplicated, maximum five.                                                                                                                  |
+| `OPENROUTER_FALLBACK_MODELS` | `openrouter/free`                                      | Ordered comma-separated model IDs, deduplicated, maximum five.                                                                                                                  |
 | `WEB_SEARCH_PROVIDER`        | automatic                                             | Optional `brave`, `firecrawl`, or `gemini`. Without an override, configured keys are preferred in that order.                                                                   |
 | `BRAVE_SEARCH_API_KEY`       | unset                                                 | Enables Brave search.                                                                                                                                                           |
 | `FIRECRAWL_API_KEY`          | unset                                                 | Enables Firecrawl search and page/PDF reading.                                                                                                                                  |
@@ -61,7 +61,7 @@ Configuration is validated once at startup. Provider URLs, credentials, models, 
 | `GEMINI_SEARCH_MODEL`        | `gemini-2.5-flash`                                    | Independent of the answering model.                                                                                                                                             |
 | `JINA_API_KEY`               | unset                                                 | Optional credential for Jina Reader. The reader is also used without a key.                                                                                                     |
 | `ENABLE_IMAGE_GENERATION`    | `false`                                               | Opt-in image tool. Requires primary configuration and positive model discovery.                                                                                                 |
-| `IMAGE_GENERATION_MODEL`     | `gpt-image-2`                                         | Primary image model; must be advertised by `/models`.                                                                                                                           |
+| `IMAGE_GENERATION_MODEL`     | `gpt-image-2.5-sunburst`                              | Primary image model; must be advertised by `/models`.                                                                                                                           |
 | `PUBLIC_SERVICE_URL`         | `RENDER_EXTERNAL_URL`, then `http://localhost:<PORT>` | Public service identity in provider headers.                                                                                                                                    |
 | `APP_NAME`                   | `SignLoop Chat Service`                               | Provider `X-Title` identity.                                                                                                                                                    |
 | `PORT`                       | `10000`                                               | Listening port, 1–65535. Render supplies this.                                                                                                                                  |
@@ -71,9 +71,11 @@ Configuration is validated once at startup. Provider URLs, credentials, models, 
 | `BUN_VERSION`                | `1.3.11` in Blueprint                                 | Render runtime pin.                                                                                                                                                             |
 | `NODE_ENV`                   | `production` in Blueprint                             | Render environment.                                                                                                                                                             |
 
+All answering providers request high reasoning effort through a shared policy. OpenAI-compatible primary and OpenRouter requests explicitly apply it to model aliases without requesting reasoning summaries. Native Gemini chat uses high thinking. Gemini search uses the maximum supported thinking budget for Gemini 2.5 (24,576 tokens for Flash variants, 32,768 for Pro), with another 2,048 output tokens available for its grounded brief; Gemini 3+ uses high thinking with a 32,768-token output budget. Provider deadlines still apply.
+
 An explicit search provider selects one integration; it is not a retry chain between search providers. Search failure becomes a tool error so the model can refine its query or explain the limitation. Page reading prefers Firecrawl and can fall back to Jina within a shared deadline. `http_get` needs no search key.
 
-Image generation is disabled unless explicitly enabled and discovery confirms the configured image model. An unavailable discovery endpoint does not expose the image tool. Images use the primary endpoint even when text generation has fallen back to OpenRouter.
+Image generation is disabled unless explicitly enabled and discovery confirms the configured image model. The Render Blueprint enables it and requires `PRIMARY_LLM_BASE_URL` and `PRIMARY_LLM_API_KEY`. An unavailable discovery endpoint does not expose the image tool. Images use the primary endpoint even when text generation has fallen back to OpenRouter.
 
 ## Public API
 

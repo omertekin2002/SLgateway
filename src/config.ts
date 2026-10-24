@@ -1,5 +1,5 @@
 export const OPENROUTER_FALLBACK_MODELS = Object.freeze([
-  "nvidia/nemotron-3-ultra-550b-a55b:free",
+  "openrouter/free",
 ] as const);
 
 export const MAX_OPENROUTER_FALLBACK_MODELS = 5;
@@ -293,7 +293,8 @@ export function loadServiceConfig(
     imageGenerationEnabled: imageEnabled === "true",
     imageGenerationModel: parseProviderModel(
       "IMAGE_GENERATION_MODEL",
-      optionalValue(environment, "IMAGE_GENERATION_MODEL") ?? "gpt-image-2",
+      optionalValue(environment, "IMAGE_GENERATION_MODEL") ??
+        "gpt-image-2.5-sunburst",
     ),
     primaryLlm,
     openRouter,
