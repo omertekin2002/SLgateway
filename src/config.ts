@@ -192,7 +192,7 @@ export function loadServiceConfig(
   );
   const primaryModel = parseProviderModel(
     "PRIMARY_LLM_MODEL",
-    configuredPrimaryModel ?? "gpt-5.6-luna",
+    configuredPrimaryModel ?? "gpt-6.1-sol",
   );
 
   if (
@@ -229,7 +229,7 @@ export function loadServiceConfig(
       })
     : null;
 
-  // The Gemini key serves both grounded search and, first in the chain, chat generation.
+  // The Gemini key serves both grounded search and generation after the configured primary.
   const geminiChat = geminiApiKey
     ? Object.freeze({
         apiKey: geminiApiKey,

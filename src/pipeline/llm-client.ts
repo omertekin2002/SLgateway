@@ -6,7 +6,7 @@ import OpenAI from "openai";
 
 export type LlmProvider = "gemini" | "primary-openai-compatible" | "openrouter";
 
-/** Native Gemini API generation; tried before every other provider. */
+/** Native Gemini API generation; tried after the configured primary and before OpenRouter. */
 export type GeminiProviderConfig = {
   readonly apiKey: string;
   readonly model: string;

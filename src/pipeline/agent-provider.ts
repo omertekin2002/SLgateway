@@ -135,9 +135,6 @@ export function listProviderCandidates(
   config: Pick<ProviderConfig, "gemini" | "primary" | "openRouter">,
 ): { provider: LlmProvider; model: string }[] {
   return [
-    ...(config.gemini
-      ? [{ provider: "gemini" as const, model: config.gemini.model }]
-      : []),
     ...(config.primary
       ? [
           {
@@ -145,6 +142,9 @@ export function listProviderCandidates(
             model: config.primary.model,
           },
         ]
+      : []),
+    ...(config.gemini
+      ? [{ provider: "gemini" as const, model: config.gemini.model }]
       : []),
     ...(config.openRouter
       ? (config.openRouter.models ?? OPENROUTER_FALLBACK_MODELS).map((model) => ({

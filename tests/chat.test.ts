@@ -1049,20 +1049,25 @@ it.each([
   },
 );
 
-it("tries Gemini first with high thinking, then the primary, then OpenRouter", async () => {
+it("tries the primary first, then high-thinking Gemini, then OpenRouter", async () => {
   const calls: string[] = [];
   const failing = (name: string) =>
     new MockLanguageModelV4({
       doStream: async () => {
         calls.push(name);
-        // A request-shaped Gemini error must not stop the chain: only OpenRouter errors are
-        // screened by the fallback-eligibility policy.
+        // Request-shaped primary and Gemini errors must not stop the chain: only OpenRouter
+        // errors are screened by the fallback-eligibility policy.
         throw Object.assign(new Error(`${name} failed`), { status: 400 });
       },
     });
   const gemini = failing("gemini");
   const primary = failing("primary");
-  const fallback = scriptedModel();
+  const fallback = new MockLanguageModelV4({
+    doStream: async () => {
+      calls.push("openrouter");
+      return streamStep(0) as StepResult;
+    },
+  });
   mocks.gemini.mockReturnValue(gemini);
   mocks.responses.mockImplementation((model: string) =>
     model === "primary" ? primary : fallback,
@@ -1077,12 +1082,38 @@ it("tries Gemini first with high thinking, then the primary, then OpenRouter", a
   });
 
   expect(mocks.gemini).toHaveBeenCalledWith("gemini-3.8-flash");
-  expect(calls).toEqual(["gemini", "primary"]);
+  expect(calls).toEqual(["primary", "gemini", "openrouter"]);
   expect(reply).toMatchObject({ provider: "openrouter", model: "fallback" });
   expect(gemini.doStreamCalls[0]?.providerOptions).toEqual({
     openai: { store: false },
     google: { thinkingConfig: { thinkingLevel: "high" } },
   });
+});
+
+it("uses the primary without calling Gemini or OpenRouter when it answers", async () => {
+  const primary = scriptedModel();
+  const gemini = scriptedModel();
+  const fallback = scriptedModel();
+  mocks.gemini.mockReturnValue(gemini);
+  mocks.responses.mockImplementation((model: string) =>
+    model === "primary" ? primary : fallback,
+  );
+
+  const reply = await generateReply(messages, {
+    ...baseOptions,
+    providerConfig: {
+      ...baseOptions.providerConfig,
+      gemini: { apiKey: "gemini-key", model: "gemini-3.8-flash" },
+    },
+  });
+
+  expect(reply).toMatchObject({
+    provider: "primary-openai-compatible",
+    model: "primary",
+  });
+  expect(primary.doStreamCalls).toHaveLength(1);
+  expect(gemini.doStreamCalls).toHaveLength(0);
+  expect(fallback.doStreamCalls).toHaveLength(0);
 });
 
 it("waits longer for Gemini to start answering than for other providers", async () => {
@@ -1138,10 +1169,17 @@ it("still abandons a silent non-Gemini provider after the default deadline", asy
   }
 });
 
-it("reports Gemini as the provider when it answers", async () => {
+it("reports Gemini as the provider when it answers after primary failure", async () => {
   mocks.gemini.mockReturnValue(scriptedModel());
-  const other = scriptedModel();
-  mocks.responses.mockReturnValue(other);
+  const primary = new MockLanguageModelV4({
+    doStream: async () => {
+      throw new Error("Primary unavailable");
+    },
+  });
+  const fallback = scriptedModel();
+  mocks.responses.mockImplementation((model: string) =>
+    model === "primary" ? primary : fallback,
+  );
 
   const reply = await generateReply(messages, {
     ...baseOptions,
@@ -1152,7 +1190,8 @@ it("reports Gemini as the provider when it answers", async () => {
   });
 
   expect(reply).toMatchObject({ provider: "gemini", model: "gemini-3.8-flash" });
-  expect(other.doStreamCalls).toHaveLength(0);
+  expect(primary.doStreamCalls).toHaveLength(1);
+  expect(fallback.doStreamCalls).toHaveLength(0);
 });
 
 it("checks text and image model availability concurrently", async () => {

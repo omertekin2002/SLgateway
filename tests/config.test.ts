@@ -38,7 +38,7 @@ describe("loadServiceConfig", () => {
     expect(config.primaryLlm).toEqual({
       baseUrl: "https://primary.example.test/v1",
       apiKey: "primary-secret",
-      model: "gpt-5.6-luna",
+      model: "gpt-6.1-sol",
       modelWasDefaulted: true,
     });
     expect(config.openRouter).toBeNull();
