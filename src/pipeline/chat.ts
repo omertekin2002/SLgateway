@@ -1,4 +1,4 @@
-// Ported from SignLoop apps/web/lib/chat.ts at 7605fea16c981b1f027ae54e6ef03aada3363b1c.
+// Ported from SignLoop apps/web/lib/chat.ts at 61c90b508a789cee988acdded52b2d1a8c82ee69.
 import {
   ToolLoopAgent,
   isStepCount,
@@ -18,6 +18,7 @@ import { createRoutedModel } from "./agent-provider";
 export { createRoutedModel, FirstChunkTimeoutError } from "./agent-provider";
 import { discoverPrimaryModelAvailability } from "./provider-models";
 import { ResearchUnavailableError, type ResearchMode } from "./research-policy";
+import { TEXT_REASONING_EFFORT } from "./reasoning-policy";
 import type { WebSearchMetadata } from "./gemini-search";
 import { searchWeb } from "./web-search";
 import { buildAuthoritativeUtcTimeContext } from "./chat-time";
@@ -56,6 +57,7 @@ const TOOL_NOTES = {
 const NO_TOOLS_INSTRUCTIONS =
   "No tools are available in this session. Do not claim to search, read pages, or open documents.";
 
+/** Describe the enabled tools and their evidence rules for the answering model. */
 function buildToolInstructions(notes: string[]): string {
   if (!notes.length) return NO_TOOLS_INSTRUCTIONS;
   return `
@@ -84,6 +86,7 @@ const CHAT_TOOL_NAMES = new Set<string>([
   "http_get",
   "generate_image",
 ]);
+/** Narrow SDK tool events to the public tools exposed by this gateway. */
 export function isChatToolName(value: string): value is ChatToolName {
   return CHAT_TOOL_NAMES.has(value);
 }
@@ -144,6 +147,7 @@ export type ChatGenerationOptions = {
   };
 };
 
+/** Stream an agentic turn with tool progress and provider fallback between model steps. */
 export async function* generateChatReplyStream(
   messages: readonly ChatMessage[],
   options: ChatGenerationOptions,
@@ -322,9 +326,15 @@ export async function* generateChatReplyStream(
     maxOutputTokens: options?.maxOutputTokens,
     maxRetries: 0,
     providerOptions: {
-      openai: { store: false },
+      openai: {
+        store: false,
+        reasoningEffort: TEXT_REASONING_EFFORT,
+        // Compatible gateways and OpenRouter use aliases the SDK cannot classify itself.
+        forceReasoning: true,
+        reasoningSummary: null,
+      },
       // Gemini streams nothing while it thinks; agent-provider gives it a longer opening deadline.
-      google: { thinkingConfig: { thinkingLevel: "high" } },
+      google: { thinkingConfig: { thinkingLevel: TEXT_REASONING_EFFORT } },
     },
     prepareStep: ({ stepNumber }) => {
       if (stepNumber >= MAX_STEPS - 1) return { toolChoice: "none" as const };
@@ -451,6 +461,7 @@ export async function* generateChatReplyStream(
   }
 }
 
+/** Collect the streaming agent's canonical final reply for non-streaming callers. */
 export async function generateChatReply(
   messages: readonly ChatMessage[],
   options: ChatGenerationOptions,

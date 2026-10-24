@@ -1,4 +1,4 @@
-// Ported from SignLoop at 3f830abaae4d47dedecabea3fca57a4899a8f688.
+// Ported from SignLoop at 61c90b508a789cee988acdded52b2d1a8c82ee69.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -20,7 +20,7 @@ describe("generateImageReply", () => {
     });
   });
 
-  it("forwards the prompt to gpt-image-2 and returns renderable markdown", async () => {
+  it("forwards the prompt to gpt-image-2.5-sunburst and returns renderable markdown", async () => {
     mocks.generate.mockResolvedValue({
       data: [{ b64_json: "aW1hZ2U=" }],
     });
@@ -36,7 +36,7 @@ describe("generateImageReply", () => {
       }),
     ).resolves.toEqual({
       message: "![Generated image](data:image/png;base64,aW1hZ2U=)",
-      model: "gpt-image-2",
+      model: "gpt-image-2.5-sunburst",
       provider: "primary-openai-compatible",
     });
     expect(mocks.createClient).toHaveBeenCalledWith(
@@ -50,7 +50,7 @@ describe("generateImageReply", () => {
     );
     expect(mocks.generate).toHaveBeenCalledWith(
       {
-        model: "gpt-image-2",
+        model: "gpt-image-2.5-sunburst",
         prompt: "A signed contract on a desk",
         n: 1,
         output_format: "png",
@@ -83,7 +83,7 @@ const imageOptions = {
     publicServiceUrl: "https://service.test",
     appName: "Test",
   },
-  model: "gpt-image-2",
+  model: "gpt-image-2.5-sunburst",
 };
 
 it.each(["!invalid!", "A".repeat(8 * 1024 * 1024 + 1)])(
